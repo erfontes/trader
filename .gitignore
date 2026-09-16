@@ -1,17 +1,12 @@
 # Virtual environments
 bin/
 lib/
+lib64
 lib64/
 include/
 share/
 pyvenv.cfg
-trader/bin/
-trader/lib/
-trader/lib64/
-trader/include/
-trader/share/
-trader/pyvenv.cfg
-trader/etc/
+trader/
 .venv/
 venv/
 env/
