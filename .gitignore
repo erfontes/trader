@@ -1,0 +1,47 @@
+# Virtual environments
+bin/
+lib/
+lib64/
+include/
+share/
+pyvenv.cfg
+trader/bin/
+trader/lib/
+trader/lib64/
+trader/include/
+trader/share/
+trader/pyvenv.cfg
+trader/etc/
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# Database files
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+ollama.log
+gemma4_pipeline_server.log
+cron_pipeline.log
+
+# Environment variables & secrets
+.env
+daily_pipeline.env
+*.local
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
