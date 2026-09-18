@@ -770,10 +770,10 @@ def generate_html_report(inferences, macro_info, gemma_narrative=None):
 
     vix_color = "#ef4444" if macro_info['VIX_Change'] > 0 else "#10b981"
     narrative_block = f"""
-    <!-- Gemma 4 Executive Commentary -->
+    <!-- EF Strategy Synthesis Commentary -->
     <div style="background-color: #1e1b4b44; padding: 20px 24px; border-bottom: 1px solid #334155;">
         <h3 style="font-size: 15px; margin: 0 0 12px 0; color: #c084fc; letter-spacing: 0.3px;">
-            🤖 GEMMA 4 31B STRATEGY SYNTHESIS
+            ⚡ EF STRATEGY SYNTHESIS
         </h3>
         <div style="font-size: 13.5px; line-height: 1.6; color: #e2e8f0;">
             {gemma_narrative}
