@@ -359,7 +359,7 @@ def update_news():
 # ==============================================================================
 # 5. Gemma 4 Sentiment & Materiality Scoring
 # ==============================================================================
-def score_single_news_item(ticker, title, summary, num_votes=5):
+def score_single_news_item(ticker, title, summary, num_votes=1):
     prompt = f"""
     Analyze financial market news for {ticker}.
     Headline: {title}
@@ -378,35 +378,41 @@ def score_single_news_item(ticker, title, summary, num_votes=5):
         "prompt": prompt,
         "stream": False,
         "format": "json",
-        "options": {"temperature": 0.3}
+        "options": {
+            "temperature": 0.2,
+            "num_predict": 80
+        }
     }
 
-    def single_vote():
+    sent_votes, mat_votes = [], []
+    for _ in range(num_votes):
         try:
-            res = requests.post(f"{GEMMA4_URL}/api/generate", json=payload, timeout=45)
+            res = requests.post(f"{GEMMA4_URL}/api/generate", json=payload, timeout=25)
             if res.status_code == 200:
-                raw_json = res.json()
-                text = raw_json.get("response", "{}")
-                # Parse sentiment and materiality
-                data = json.loads(text)
-                return float(data.get("sentiment", 0.0)), float(data.get("materiality", 0.7))
+                raw_text = res.json().get("response", "{}")
+                clean_text = re.sub(r"```(?:json)?\s*", "", raw_text)
+                clean_text = re.sub(r"\s*```", "", clean_text).strip()
+                s, m = None, None
+                try:
+                    data = json.loads(clean_text)
+                    s = float(data.get("sentiment", 0.0))
+                    m = float(data.get("materiality", 0.7))
+                except Exception:
+                    sent_m = re.search(r'"sentiment":\s*(-?\d*\.?\d+)', raw_text)
+                    mat_m = re.search(r'"materiality(?:_score)?":\s*(\d*\.?\d+)', raw_text)
+                    s = float(sent_m.group(1)) if sent_m else None
+                    m = float(mat_m.group(1)) if mat_m else 0.7
+
+                if s is not None: sent_votes.append(s)
+                if m is not None: mat_votes.append(m)
         except Exception:
             pass
-        return None, None
-
-    sent_votes, mat_votes = [], []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_votes) as executor:
-        futures = [executor.submit(single_vote) for _ in range(num_votes)]
-        for fut in concurrent.futures.as_completed(futures):
-            s, m = fut.result()
-            if s is not None: sent_votes.append(s)
-            if m is not None: mat_votes.append(m)
 
     if not sent_votes:
         return 0.0, 0.0, 0, 0.5
     return float(np.median(sent_votes)), float(np.std(sent_votes)), len(sent_votes), float(np.median(mat_votes))
 
-def process_unscored_news(max_items=30, num_votes=3):
+def process_unscored_news(max_items=25, num_votes=1):
     max_items = int(os.getenv("MAX_NEWS_TO_SCORE", str(max_items)))
     conn = get_db()
     # Prioritize recent pre-market news first
@@ -524,15 +530,24 @@ def build_feature_dataset():
     stock_df['Vol_SMA20'] = stock_df.groupby('Ticker')['Volume'].transform(lambda x: x.rolling(20, min_periods=5).mean())
     stock_df['Volume_Surge'] = stock_df['Volume'] / (stock_df['Vol_SMA20'] + 1e-6)
 
-    # Next-day Target for training (1 if next day return > 0, else 0)
-    stock_df['Target'] = stock_df.groupby('Ticker')['Price'].shift(-1)
-    stock_df['Target'] = (stock_df['Target'] > stock_df['Price']).astype(float)
+    # Next-day Target for training (combining directional return & market alpha outperformance)
+    stock_df['Next_Price'] = stock_df.groupby('Ticker')['Price'].shift(-1)
+    stock_df['Next_Return'] = (stock_df['Next_Price'] - stock_df['Price']) / (stock_df['Price'] + 1e-6)
 
     # Merge macros
     merged = stock_df.merge(vix_df, on='Date', how='left')
     merged = merged.merge(spy_df, on='Date', how='left')
     merged = merged.merge(qqq_df, on='Date', how='left')
     merged['Excess_Return'] = merged['Daily_Return'] - merged['SPY_Return']
+
+    # Next-day SPY return for relative alpha target
+    merged['Next_SPY_Return'] = merged.groupby('Ticker')['SPY_Return'].shift(-1)
+    merged['Next_Excess_Return'] = merged['Next_Return'] - merged['Next_SPY_Return']
+
+    # Target: 1 if next-day price goes UP and either beats or matches SPY (isolating genuine alpha)
+    # Eliminates false bull signals that only drift on systemic market beta without alpha
+    merged['Target'] = ((merged['Next_Return'] > 0) & (merged['Next_Excess_Return'] >= -0.001)).astype(float)
+    merged.loc[merged['Next_Price'].isna(), 'Target'] = np.nan
 
     # Merge sentiment
     if not sent_df.empty:
@@ -590,13 +605,13 @@ def run_models_and_inference():
     X_train = train_df[feature_cols]
     y_train = train_df['Target'].astype(int)
 
-    # 1. Fit Locked-in LightGBM
+    # 1. Fit Tuned LightGBM (Regularized for noise reduction)
     lgb = LGBMClassifier(
-        n_estimators=80,
+        n_estimators=60,
         max_depth=3,
-        learning_rate=0.02,
-        colsample_bytree=0.7,
-        subsample=0.8,
+        learning_rate=0.015,
+        colsample_bytree=0.8,
+        subsample=0.7,
         min_child_samples=15,
         random_state=42,
         n_jobs=1,
@@ -604,10 +619,10 @@ def run_models_and_inference():
     )
     lgb.fit(X_train, y_train)
 
-    # 2. Fit Locked-in Random Forest
+    # 2. Fit Tuned Random Forest (Capped depth=3 to prevent leaf overfitting)
     rf = RandomForestClassifier(
-        n_estimators=120,
-        max_depth=4,
+        n_estimators=100,
+        max_depth=3,
         min_samples_split=8,
         max_features='sqrt',
         random_state=42,
@@ -640,19 +655,25 @@ def run_models_and_inference():
 
         conviction = max(final_prob, 1.0 - final_prob)
 
-        # Decision rule & conviction tier
+        # Decision rule & conviction tier tailored specifically for 9:15 - 9:30 AM EST execution
         if final_prob >= 0.55:
             action = "BUY / LONG"
             color = "#10b981"
-            badge = "🟢 BUY"
+            badge = "🟢 LONG (9:15-9:30)"
+            bias = "📈 Bullish Rally"
+            plan = "Enter Long at open; target upside momentum & alpha"
         elif final_prob <= 0.45:
-            action = "SELL / SHORT"
+            action = "SHORT / FADE"
             color = "#ef4444"
-            badge = "🔴 SELL"
+            badge = "🔴 SHORT (9:15-9:30)"
+            bias = "📉 Bearish Drop"
+            plan = "Fade open / Short; target downside mean-reversion"
         else:
             action = "HOLD / PASS"
             color = "#6b7280"
-            badge = "⚪ HOLD"
+            badge = "⚪ PASS (Chop)"
+            bias = "⚖️ Neutral Chop"
+            plan = "No statistical edge; preserve capital, wait on sidelines"
 
         high_conviction = conviction >= 0.60 or conviction <= 0.40
 
@@ -665,6 +686,8 @@ def run_models_and_inference():
             'Action': action,
             'Badge': badge,
             'Color': color,
+            'Bias': bias,
+            'Plan': plan,
             'High_Conviction': high_conviction,
             'Model_Used': model_used,
             'Sent_Intensity': latest_row['Avg_Intensity'].values[0],
@@ -696,17 +719,19 @@ def generate_gemma4_narrative(inferences, macro_info):
     for inf in inferences:
         flag = " [HIGH CONVICTION]" if inf['High_Conviction'] else ""
         stock_summaries.append(
-            f"- {inf['Ticker']}: Action {inf['Action']}{flag} | Conviction: {inf['Conviction']*100:.1f}% | "
+            f"- {inf['Ticker']}: {inf['Badge']}{flag} (Target Bias: {inf['Bias']}) | Conviction: {inf['Conviction']*100:.1f}% | "
             f"P(Up): {inf['Prob_Up']*100:.1f}% | Price: ${inf['Price']:.2f} | 5D Ret: {inf['Return_5d']:+.1f}% | "
-            f"Sentiment: {inf['Sent_Intensity']:+.2f} | Divergence: {inf['Sent_Divergence']:+.2f} | Specialist: {inf['Model_Used']}"
+            f"Sentiment: {inf['Sent_Intensity']:+.2f} | Divergence: {inf['Sent_Divergence']:+.2f} | Specialist: {inf['Model_Used']} | "
+            f"Tactical Plan: {inf['Plan']}"
         )
     stocks_text = "\n".join(stock_summaries)
 
     prompt = f"""
-You are an elite quantitative portfolio manager writing the 8:00 AM Morning Trading Briefing for the lead trader.
+You are an elite quantitative portfolio manager writing the Pre-Market Trading Briefing for the lead trader.
 Market Session: {macro_info['Date']}
+CRITICAL EXECUTION WINDOW: 9:15 AM - 9:30 AM EST (Market Open Action)
 
-MACRO INDICATORS:
+MACRO REGIME:
 - VIX: {macro_info['VIX']:.2f} ({macro_info['VIX_Change']:+.2f}%)
 - S&P 500 (SPY 1D): {macro_info['SPY_Return']:+.2f}%
 - Tech Cluster Sentiment: {macro_info['Tech_Cluster_Sent']:+.2f}
@@ -715,11 +740,14 @@ QUANTITATIVE ML ENSEMBLE PREDICTIONS:
 {stocks_text}
 
 Provide an executive trading note formatted in clean HTML (use <p>, <ul>, <li>, <strong> only):
-1. <strong>Macro & Volatility Climate</strong>: 2 concise sentences on market risk regime.
-2. <strong>Tactical Positioning & Stock Setups</strong>: 1-2 bullet points per key stock synthesizing momentum, sentiment divergence, and the model's stance.
-3. <strong>Highest Conviction Play & Risk Rules</strong>: Highlight the top setup and capital preservation rule for the day.
+1. <strong>Macro & Volatility Climate</strong>: 2 concise sentences on market risk regime heading into the 9:15-9:30 AM open.
+2. <strong>Tactical Positioning & 9:15-9:30 AM Setups</strong>: 1-2 bullet points per key stock detailing the exact trade execution:
+   - For 🔴 SHORT: explicitly advise fading the morning open or shorting overextended moves (expecting price decline).
+   - For 🟢 LONG: explicitly advise buying the open or morning dip for upside momentum & alpha outperformance.
+   - For ⚪ PASS: state why capital should remain in cash/sidelined.
+3. <strong>Highest Conviction Play & Risk Rules</strong>: Highlight the single top trade for the 9:15-9:30 AM open and strict stop-loss rules (e.g., hard stop 1.5% from entry).
 
-Keep it sharp, professional, and actionable.
+Keep it sharp, professional, and directly actionable for the 9:15-9:30 AM EST open.
 """
     payload = {
         "model": "gemma4:31b",
@@ -760,6 +788,9 @@ def generate_html_report(inferences, macro_info, gemma_narrative=None):
                     {inf['Badge']}
                 </span>
             </td>
+            <td style="padding: 12px 14px; text-align: center; color: {inf['Color']}; font-weight: 600; font-size: 13px;">
+                {inf['Bias']}
+            </td>
             <td style="padding: 12px 14px; font-weight: 700; color: #f8fafc; text-align: right;">{conv_pct:.1f}%</td>
             <td style="padding: 12px 14px; color: #94a3b8; text-align: right;">{prob_pct:.1f}%</td>
             <td style="padding: 12px 14px; color: #f8fafc; text-align: right;">${inf['Price']:.2f}</td>
@@ -789,7 +820,7 @@ def generate_html_report(inferences, macro_info, gemma_narrative=None):
         <title>⚡ Pre-Market Quant Intelligence Briefing</title>
     </head>
     <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #0f172a; color: #e2e8f0; margin: 0; padding: 24px;">
-        <div style="max-width: 780px; margin: 0 auto; background-color: #1e293b; border-radius: 12px; border: 1px solid #334155; overflow: hidden; box-shadow: 0 10px 25px rgba(0,0,0,0.5);">
+        <div style="max-width: 820px; margin: 0 auto; background-color: #1e293b; border-radius: 12px; border: 1px solid #334155; overflow: hidden; box-shadow: 0 10px 25px rgba(0,0,0,0.5);">
             
             <!-- Header -->
             <div style="background: linear-gradient(135deg, #1e1b4b 0%, #0f172a 100%); padding: 24px; border-bottom: 1px solid #334155;">
@@ -799,7 +830,7 @@ def generate_html_report(inferences, macro_info, gemma_narrative=None):
                     </h1>
                 </div>
                 <p style="margin: 6px 0 0 0; font-size: 13px; color: #94a3b8;">
-                    Market Session: <strong style="color: #f8fafc;">{macro_info['Date']}</strong> | Ready by 8:00 AM EST | Gemma 4 31B + ML Ensemble
+                    Market Session: <strong style="color: #f8fafc;">{macro_info['Date']}</strong> | Execution Window: <strong style="color: #38bdf8;">9:15 – 9:30 AM EST</strong> | Directional Alpha + Gemma 4 Ensemble
                 </p>
             </div>
 
@@ -814,13 +845,14 @@ def generate_html_report(inferences, macro_info, gemma_narrative=None):
 
             <!-- Actions Table -->
             <div style="padding: 24px;">
-                <h2 style="font-size: 16px; margin: 0 0 14px 0; color: #f8fafc;">🎯 Recommended Actions & Conviction Rankings</h2>
+                <h2 style="font-size: 16px; margin: 0 0 14px 0; color: #f8fafc;">🎯 Recommended Actions & Conviction Rankings (9:15 – 9:30 AM EST)</h2>
                 <div style="overflow-x: auto;">
                     <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 14px;">
                         <thead>
                             <tr style="background-color: #0f172a; color: #94a3b8; font-size: 12px; text-transform: uppercase;">
                                 <th style="padding: 10px 14px;">Ticker</th>
-                                <th style="padding: 10px 14px; text-align: center;">Action</th>
+                                <th style="padding: 10px 14px; text-align: center;">Signal (9:15-9:30)</th>
+                                <th style="padding: 10px 14px; text-align: center;">Target Bias</th>
                                 <th style="padding: 10px 14px; text-align: right;">Conviction</th>
                                 <th style="padding: 10px 14px; text-align: right;">P(Up)</th>
                                 <th style="padding: 10px 14px; text-align: right;">Close</th>
@@ -836,10 +868,11 @@ def generate_html_report(inferences, macro_info, gemma_narrative=None):
 
                 <!-- Guidance notes -->
                 <div style="margin-top: 24px; padding: 16px; background-color: #0f172a; border-radius: 8px; border-left: 4px solid #38bdf8; font-size: 13px; line-height: 1.5; color: #94a3b8;">
-                    <strong style="color: #38bdf8;">📌 Execution Strategy & Conviction Thresholds:</strong><br>
-                    • <strong>High Conviction (🔥 &ge; 60% or &le; 40%)</strong>: Historically demonstrated 62.5% out-of-sample win rate.<br>
-                    • <strong>Selective Action (&ge; 55% or &le; 45%)</strong>: 58.1% win rate. Clean momentum & sentiment divergence alignment.<br>
-                    • <strong>Hold / Neutral (45% - 55%)</strong>: Expected value within noise threshold. Stay on sidelines or protect capital.
+                    <strong style="color: #38bdf8;">📌 9:15 – 9:30 AM EST Tactical Execution Rules:</strong><br>
+                    • <strong>🟢 LONG (Buy Open)</strong>: Directional Alpha target &ge; 55%. Buy during the 9:15-9:30 AM open window to capture momentum & relative outperformance.<br>
+                    • <strong>🔴 SHORT (Fade Open)</strong>: Directional Alpha target &le; 45%. Fade overextended morning moves or enter short for downside mean-reversion.<br>
+                    • <strong>⚪ PASS (Chop / Cash)</strong>: P(Up) between 45% - 55%. Trade edge is within bid-ask noise. Preserve capital on the sidelines.<br>
+                    • <strong>Strict Stop-Loss</strong>: Apply a hard 1.5% stop-loss from entry price. Never average down on an adverse opening move.
                 </div>
             </div>
 
