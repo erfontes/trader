@@ -17,7 +17,8 @@ An end-to-end quantitative trading pipeline designed for pre-market execution be
 │     OHLCV Data Ingestion      │                         │     Curated News Gathering      │
 │  yfinance: Stocks & Macro     │                         │ Yahoo Finance + Google News RSS │
 │   (GOOGL, NVDA, TSLA, COST,   │                         │  Headline Dedup + Pub Weighting │
-│       AMD, ^VIX, SPY, QQQ)    │                         └────────────────┬────────────────┘
+│     AMD, ^VIX, SPY, QQQ,      │                         └────────────────┬────────────────┘
+│          SMH, XLP)            │                                          │
 └──────────────┬────────────────┘                                          │
                │                                                           ▼
                │                                          ┌─────────────────────────────────┐
@@ -29,18 +30,21 @@ An end-to-end quantitative trading pipeline designed for pre-market execution be
                └─────────────────────────────┬─────────────────────────────┘
                                              ▼
                               ┌─────────────────────────────┐
-                              │     31 Alpha Signals        │
+                              │     36 Alpha Signals        │
                               │ • Intraday Candlestick CLV  │
+                              │ • SMH & XLP Sector Signals  │
                               │ • Rolling Beta & Covariance │
                               │ • Price-Sentiment Mismatch  │
                               │ • Volume Surges & RSI       │
                               └──────────────┬──────────────┘
                                              ▼
                               ┌─────────────────────────────┐
-                              │ Locked-in Model Ensemble    │
-                              │ • 60% Tuned LightGBM        │
-                              │ • 40% Tuned Random Forest   │
+                              │  Asset Specialist Router    │
                               │ • NVDA Tuned RF Specialist  │
+                              │ • AMD Semi Specialist       │
+                              │ • COST Staples-RF Specialist│
+                              │ • GOOGL Tuned LGBM          │
+                              │ • TSLA 60/40 Ensemble       │
                               └──────────────┬──────────────┘
                                              ▼
                               ┌─────────────────────────────┐
@@ -56,6 +60,20 @@ An end-to-end quantitative trading pipeline designed for pre-market execution be
                               │   Dispatched by 8:00 AM     │
                               └─────────────────────────────┘
 ```
+
+---
+
+## 🧠 Model Architecture & Recency Adaptation
+
+The pipeline uses an **Asset Specialist Router** with **Exponential Recency Weighting** rather than treating historical data uniformly:
+1. **1-Year Expanding Baseline**: Maintains ~1,300+ historical bars so models retain structural macro regime awareness (high/low VIX periods, rate prints, multi-month trends).
+2. **Exponential Recency Decay**: Applies sample weights $w_t = \exp\left(-\frac{\ln(2)}{H} \Delta t\right)$ with a configurable half-life (default: `RECENCY_HALF_LIFE_DAYS=60`). Recent 30-day market conditions have **~2.8x higher influence** on tree splits than data from 90 days ago.
+3. **Asset-Specific Specialization**:
+   - **NVDA** $\rightarrow$ Tuned Random Forest Specialist (captures chip momentum & volume surges).
+   - **AMD** $\rightarrow$ Dedicated Semiconductor Specialist (incorporates `SMH` sector signals).
+   - **COST** $\rightarrow$ Staples-RF Specialist (anchored on `XLP` consumer staples benchmark).
+   - **GOOGL** $\rightarrow$ Tuned LightGBM Specialist (non-linear gradient boosting).
+   - **TSLA** $\rightarrow$ 60/40 Regularized Ensemble with selective conviction filtering.
 
 ---
 

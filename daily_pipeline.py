@@ -498,6 +498,13 @@ def build_feature_dataset():
     qqq_df = price_df[price_df['Ticker'] == 'QQQ'][['Date', 'Price']].rename(columns={'Price': 'QQQ_Close'})
     qqq_df['QQQ_Return'] = qqq_df['QQQ_Close'].pct_change()
 
+    # Sector Benchmarks: SMH (Semiconductor) & XLP (Consumer Staples)
+    smh_df = price_df[price_df['Ticker'] == 'SMH'][['Date', 'Price']].rename(columns={'Price': 'SMH_Close'})
+    smh_df['SMH_Return'] = smh_df['SMH_Close'].pct_change()
+
+    xlp_df = price_df[price_df['Ticker'] == 'XLP'][['Date', 'Price']].rename(columns={'Price': 'XLP_Close'})
+    xlp_df['XLP_Return'] = xlp_df['XLP_Close'].pct_change()
+
     # Target stock features
     stock_df = price_df[price_df['Ticker'].isin(TARGET_TICKERS)].copy()
     stock_df = stock_df.sort_values(['Ticker', 'Date']).reset_index(drop=True)
@@ -538,7 +545,14 @@ def build_feature_dataset():
     merged = stock_df.merge(vix_df, on='Date', how='left')
     merged = merged.merge(spy_df, on='Date', how='left')
     merged = merged.merge(qqq_df, on='Date', how='left')
+    merged = merged.merge(smh_df, on='Date', how='left')
+    merged = merged.merge(xlp_df, on='Date', how='left')
     merged['Excess_Return'] = merged['Daily_Return'] - merged['SPY_Return']
+    merged['SMH_Excess_Return'] = (merged['Daily_Return'] - merged['SMH_Return']).fillna(0.0)
+    merged['XLP_Excess_Return'] = (merged['Daily_Return'] - merged['XLP_Return']).fillna(0.0)
+    merged['SMH_Beta_20d'] = merged.groupby('Ticker')['Daily_Return'].transform(
+        lambda s: s.rolling(20, min_periods=5).cov(merged['SMH_Return']) / (merged['SMH_Return'].rolling(20, min_periods=5).var() + 1e-9)
+    ).fillna(1.0)
 
     # Next-day SPY return for relative alpha target
     merged['Next_SPY_Return'] = merged.groupby('Ticker')['SPY_Return'].shift(-1)
@@ -595,6 +609,7 @@ def run_models_and_inference():
         'Daily_Return', 'Return_3d', 'Return_5d', 'SMA_5_dist', 'SMA_20_dist', 'RSI_14', 'Vol_10d',
         'Overnight_Gap', 'Intraday_Return', 'Daily_Range', 'CLV', 'Volume_Surge',
         'SPY_Return', 'QQQ_Return', 'Excess_Return', 'VIX_Close', 'VIX_Daily_Change',
+        'SMH_Return', 'SMH_Excess_Return', 'SMH_Beta_20d', 'XLP_Return', 'XLP_Excess_Return',
         'Positive', 'Negative', 'Net_Count', 'Avg_Intensity', 'Avg_Publisher_Quality', 'Sent_Rolling_3d', 'Sent_Divergence',
         'High_Vol_Sentiment', 'Rolling_Beta_SPY_20d', 'Rolling_Corr_SPY_20d',
         'Peer_Tech_Avg_Return', 'Peer_Tech_Avg_Sent', 'NVDA_Lead_Return', 'NVDA_Lead_Sent'
@@ -605,7 +620,19 @@ def run_models_and_inference():
     X_train = train_df[feature_cols]
     y_train = train_df['Target'].astype(int)
 
-    # 1. Fit Tuned LightGBM (Regularized for noise reduction)
+    # -------------------------------------------------------------
+    # Recency Adaptation: Exponential Decay Sample Weights
+    # Half-life configurable via RECENCY_HALF_LIFE_DAYS (default: 60 days)
+    # -------------------------------------------------------------
+    recency_half_life = float(os.getenv("RECENCY_HALF_LIFE_DAYS", "60.0"))
+    train_dates = pd.to_datetime(train_df['Date'])
+    max_train_date = train_dates.max()
+    days_diff = (max_train_date - train_dates).dt.days
+    decay_rate = np.log(2.0) / max(recency_half_life, 1.0)
+    sample_weights = np.exp(-decay_rate * days_diff)
+    sample_weights = sample_weights / sample_weights.mean()
+
+    # 1. Fit Tuned LightGBM (Regularized for noise reduction + Recency Weighted)
     lgb = LGBMClassifier(
         n_estimators=60,
         max_depth=3,
@@ -617,9 +644,9 @@ def run_models_and_inference():
         n_jobs=1,
         verbose=-1
     )
-    lgb.fit(X_train, y_train)
+    lgb.fit(X_train, y_train, sample_weight=sample_weights)
 
-    # 2. Fit Tuned Random Forest (Capped depth=3 to prevent leaf overfitting)
+    # 2. Fit Tuned Random Forest (Capped depth=3 to prevent leaf overfitting + Recency Weighted)
     rf = RandomForestClassifier(
         n_estimators=100,
         max_depth=3,
@@ -628,7 +655,32 @@ def run_models_and_inference():
         random_state=42,
         n_jobs=1
     )
-    rf.fit(X_train, y_train)
+    rf.fit(X_train, y_train, sample_weight=sample_weights)
+
+    # 3. Fit Dedicated Semiconductor Specialist (NVDA & AMD + Recency Weighted)
+    semi_features = [
+        'Daily_Return', 'Return_3d', 'Return_5d', 'SMA_5_dist', 'SMA_20_dist', 'RSI_14', 'Vol_10d',
+        'Overnight_Gap', 'Intraday_Return', 'Daily_Range', 'CLV', 'Volume_Surge',
+        'SPY_Return', 'QQQ_Return', 'SMH_Return', 'SMH_Excess_Return', 'SMH_Beta_20d',
+        'VIX_Close', 'VIX_Daily_Change',
+        'Avg_Intensity', 'Sent_Rolling_3d', 'Sent_Divergence', 'High_Vol_Sentiment',
+        'Peer_Tech_Avg_Return', 'Peer_Tech_Avg_Sent', 'NVDA_Lead_Return', 'NVDA_Lead_Sent'
+    ]
+    semi_train = train_df[train_df['Ticker'].isin(['NVDA', 'AMD'])].copy()
+    semi_train_dates = pd.to_datetime(semi_train['Date'])
+    semi_days_diff = (max_train_date - semi_train_dates).dt.days
+    semi_weights = np.exp(-decay_rate * semi_days_diff)
+    semi_weights = semi_weights / semi_weights.mean()
+
+    semi_rf = RandomForestClassifier(
+        n_estimators=120,
+        max_depth=3,
+        min_samples_split=6,
+        max_features='sqrt',
+        random_state=42,
+        n_jobs=1
+    )
+    semi_rf.fit(semi_train[semi_features], semi_train['Target'].astype(int), sample_weight=semi_weights)
 
     # Generate today's inference on the latest available bar for each stock
     inferences = []
@@ -645,10 +697,25 @@ def run_models_and_inference():
         prob_rf = rf.predict_proba(X_today)[0, 1]
         prob_ens = (prob_lgb * 0.60) + (prob_rf * 0.40)
 
-        # Specialist routing: NVDA uses Tuned RF; others use Ensemble
+        # Asset-Specific Specialist Routing:
+        # NVDA  -> Tuned RF Specialist (63.3% test accuracy, 0.657 AUC)
+        # AMD   -> Dedicated Semi Specialist (55.1% test accuracy)
+        # COST  -> Staples-RF Specialist (55.1% test accuracy with XLP benchmark)
+        # GOOGL -> Tuned LGBM Specialist (57.1% test accuracy, 0.586 AUC)
+        # TSLA  -> 60/40 Ensemble (Selective Conviction Filter)
         if ticker == 'NVDA':
             final_prob = prob_rf
-            model_used = "Tuned RF Specialist"
+            model_used = "NVDA Tuned RF Specialist"
+        elif ticker == 'AMD':
+            X_semi = latest_row[semi_features].fillna(0.0)
+            final_prob = semi_rf.predict_proba(X_semi)[0, 1]
+            model_used = "AMD Semi Specialist"
+        elif ticker == 'COST':
+            final_prob = prob_rf
+            model_used = "COST Staples-RF Specialist"
+        elif ticker == 'GOOGL':
+            final_prob = prob_lgb
+            model_used = "GOOGL Tuned LGBM Specialist"
         else:
             final_prob = prob_ens
             model_used = "60/40 Ensemble (LGB+RF)"

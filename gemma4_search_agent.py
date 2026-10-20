@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+"""
+================================================================================
+🔍 GEMMA 4 AGENTIC WEB SEARCH & EMAIL BRIEFING ENGINE
+================================================================================
+Uses local Gemma 4 31B (with MTP Speculative Decoding on port 11434) to:
+1. Auto-start gemma4_server.py via /home/erfontes/miniconda3/envs/vel/bin/python
+   if not already running (and cleanly release VRAM afterwards if started by us).
+2. Break a research topic down into targeted web & news search queries.
+3. Fetch live web & news results via DuckDuckGo (ddgs) and scrape article text.
+4. Synthesize an executive HTML briefing with clickable source citations.
+5. Dispatch the report via SMTP using credentials in /home/erfontes/research/trader/.env.
+================================================================================
+"""
+
+import os
+import sys
+import re
+import json
+import time
+import signal
+import smtplib
+import argparse
+import subprocess
+from datetime import datetime, date
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from typing import List, Dict, Any
+
+import requests
+from bs4 import BeautifulSoup
+from ddgs import DDGS
+
+# ==============================================================================
+# 1. Configuration & Environment Loading
+# ==============================================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_env_file():
+    """Load key-value pairs from .env or daily_pipeline.env in BASE_DIR."""
+    for env_name in [".env", "daily_pipeline.env"]:
+        env_path = os.path.join(BASE_DIR, env_name)
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        os.environ.setdefault(
+                            k.strip(), v.strip().strip('"').strip("'")
+                        )
+
+
+load_env_file()
+
+GEMMA4_URL = os.getenv("GEMMA4_SERVER_URL", "http://127.0.0.1:11434")
+GEMMA4_PYTHON = os.getenv(
+    "GEMMA4_PYTHON_PATH", "/home/erfontes/miniconda3/envs/vel/bin/python"
+)
+GEMMA4_SCRIPT = os.getenv(
+    "GEMMA4_SCRIPT_PATH", os.path.join(BASE_DIR, "gemma4_server.py")
+)
+MODEL_NAME = os.getenv("GEMMA4_MODEL_NAME", "gemma4:31b")
+
+DEFAULT_TOPICS = os.getenv(
+    "SEARCH_AGENT_TOPICS",
+    "Latest market-moving catalysts, AI hardware & LLM breakthroughs, and macro news for GOOGL, NVDA, COST, TSLA, AMD",
+)
+
+
+# ==============================================================================
+# 2. Gemma 4 Server Lifecycle Manager (MTP Speculative Decoding Server)
+# ==============================================================================
+def is_gemma_server_running(url: str = GEMMA4_URL, timeout: float = 3.0) -> bool:
+    try:
+        r = requests.get(f"{url}/health", timeout=timeout)
+        if r.status_code == 200:
+            return r.json().get("status") == "online"
+    except Exception:
+        return False
+    return False
+
+
+def wait_for_gemma_server(url: str = GEMMA4_URL, max_wait_sec: int = 150) -> bool:
+    print(f"⏳ Waiting up to {max_wait_sec}s for Gemma 4 MTP server to load...")
+    start = time.time()
+    while time.time() - start < max_wait_sec:
+        if is_gemma_server_running(url, timeout=2.0):
+            print(f"✅ Gemma 4 server is online after {time.time() - start:.1f}s!")
+            return True
+        time.sleep(2.5)
+    print("❌ Timed out waiting for Gemma 4 server to start.")
+    return False
+
+
+class GemmaServerContext:
+    """
+    Ensures gemma4_server.py is running.
+    If already online, uses the existing instance and leaves it running.
+    If offline, launches it via `/home/erfontes/miniconda3/envs/vel/bin/python`
+    and cleanly shuts it down on exit.
+    """
+
+    def __init__(
+        self,
+        url: str = GEMMA4_URL,
+        py_path: str = GEMMA4_PYTHON,
+        script_path: str = GEMMA4_SCRIPT,
+    ):
+        self.url = url
+        self.py_path = py_path
+        self.script_path = script_path
+        self.proc = None
+        self.started_by_us = False
+
+    def __enter__(self):
+        if is_gemma_server_running(self.url):
+            print(f"🚀 Gemma 4 MTP server is already online at {self.url}.")
+            self.started_by_us = False
+            return self
+
+        print(f"⚡ Gemma 4 server is offline. Launching via {self.py_path}...")
+        log_path = os.path.join(BASE_DIR, "gemma4_search_server.log")
+        log_file = open(log_path, "w", encoding="utf-8")
+        self.proc = subprocess.Popen(
+            [self.py_path, self.script_path],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            cwd=BASE_DIR,
+            preexec_fn=os.setsid,
+        )
+        self.started_by_us = True
+
+        if not wait_for_gemma_server(self.url, max_wait_sec=150):
+            self.cleanup()
+            raise RuntimeError("Failed to start Gemma 4 inference server.")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.started_by_us:
+            self.cleanup()
+
+    def cleanup(self):
+        if self.proc and self.proc.poll() is None:
+            print("🛑 Stopping temporary Gemma 4 server and releasing GPU VRAM...")
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+                self.proc.wait(timeout=15)
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+            print("✅ Gemma 4 server stopped.")
+
+
+# ==============================================================================
+# 3. Gemma 4 Inference Helper
+# ==============================================================================
+def ask_gemma(
+    messages: List[Dict[str, str]],
+    temperature: float = 0.3,
+    max_tokens: int = 1536,
+) -> str:
+    """Calls the /v1/chat/completions endpoint on gemma4_server.py."""
+    payload = {
+        "model": MODEL_NAME,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    resp = requests.post(
+        f"{GEMMA4_URL}/v1/chat/completions", json=payload, timeout=300
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"].strip()
+
+
+# ==============================================================================
+# 4. Web & News Search + Page Excerpt Extraction
+# ==============================================================================
+def fetch_page_excerpt(url: str, max_chars: int = 1200) -> str:
+    """Fetches a brief clean-text excerpt from a web URL to enrich search snippets."""
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+        }
+        r = requests.get(url, headers=headers, timeout=6)
+        if r.status_code != 200 or "text/html" not in r.headers.get("Content-Type", ""):
+            return ""
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
+        paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+        text = " ".join([p for p in paragraphs if len(p) > 40])
+        return text[:max_chars]
+    except Exception:
+        return ""
+
+
+def execute_searches(
+    queries: List[str],
+    max_results_per_query: int = 4,
+    timelimit: str = "w",
+    deep_scrape: bool = True,
+) -> List[Dict[str, str]]:
+    """Runs both News and Web searches via DuckDuckGo and deduplicates URLs."""
+    ddgs = DDGS()
+    collected: List[Dict[str, str]] = []
+    seen_urls = set()
+
+    for q in queries:
+        print(f"  🔎 Searching: '{q}'...")
+        # 1. Recent news search
+        try:
+            news_hits = ddgs.news(
+                q, max_results=max_results_per_query, timelimit=timelimit
+            )
+            for item in news_hits or []:
+                url = item.get("url") or item.get("href", "")
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                collected.append(
+                    {
+                        "query": q,
+                        "title": item.get("title", "Untitled"),
+                        "url": url,
+                        "source": item.get("source", "News"),
+                        "date": item.get("date", ""),
+                        "snippet": item.get("body", ""),
+                    }
+                )
+        except Exception as e:
+            print(f"    ⚠️ News search warning for '{q}': {e}")
+
+        # 2. General web search
+        try:
+            web_hits = ddgs.text(
+                q, max_results=max_results_per_query, timelimit=timelimit
+            )
+            for item in web_hits or []:
+                url = item.get("href") or item.get("url", "")
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                collected.append(
+                    {
+                        "query": q,
+                        "title": item.get("title", "Untitled"),
+                        "url": url,
+                        "source": "Web",
+                        "date": "",
+                        "snippet": item.get("body", ""),
+                    }
+                )
+        except Exception as e:
+            print(f"    ⚠️ Web search warning for '{q}': {e}")
+
+    # Enrich top results with scraped article body text
+    if deep_scrape and collected:
+        print(f"  🌐 Enriching top {min(8, len(collected))} results with page excerpts...")
+        for item in collected[:8]:
+            excerpt = fetch_page_excerpt(item["url"])
+            if excerpt:
+                item["excerpt"] = excerpt
+
+    return collected
+
+
+# ==============================================================================
+# 5. Agentic Workflow: Query Planning -> Search -> Synthesis
+# ==============================================================================
+def plan_search_queries(topic: str, num_queries: int = 4) -> List[str]:
+    """Asks Gemma 4 to act as a research planner and generate optimal search queries."""
+    today_str = date.today().strftime("%B %d, %Y")
+    prompt = (
+        f"Current Date: {today_str}\n"
+        f"Research Goal: {topic}\n\n"
+        f"Generate {num_queries} distinct, specific search engine queries to find the most "
+        f"important, up-to-date facts, news, and insights about this topic.\n"
+        f"Respond ONLY with a valid JSON array of strings, for example:\n"
+        f'["query 1", "query 2", "query 3"]'
+    )
+    print("🧠 Step 1: Asking Gemma 4 to plan targeted search queries...")
+    raw = ask_gemma([{"role": "user", "content": prompt}], temperature=0.2, max_tokens=256)
+
+    # Extract JSON array
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if match:
+        try:
+            queries = json.loads(match.group(0))
+            if isinstance(queries, list) and all(isinstance(q, str) for q in queries):
+                return [q.strip() for q in queries if q.strip()][:num_queries]
+        except Exception:
+            pass
+
+    # Fallback if JSON parsing fails
+    lines = [
+        re.sub(r"^[\d\-\*\.\s\"']+|[\"']+$", "", line.strip())
+        for line in raw.splitlines()
+        if line.strip() and not line.strip().startswith(("[", "]"))
+    ]
+    return lines[:num_queries] if lines else [topic]
+
+
+def synthesize_briefing(topic: str, results: List[Dict[str, str]]) -> str:
+    """Passes gathered search evidence to Gemma 4 to write an HTML executive briefing."""
+    today_str = date.today().strftime("%B %d, %Y")
+    context_blocks = []
+    for idx, r in enumerate(results[:18], 1):
+        block = (
+            f"[{idx}] Title: {r['title']}\n"
+            f"    Source: {r['source']} | Date: {r.get('date', 'Recent')}\n"
+            f"    URL: {r['url']}\n"
+            f"    Snippet: {r['snippet']}"
+        )
+        if r.get("excerpt"):
+            block += f"\n    Article Excerpt: {r['excerpt']}"
+        context_blocks.append(block)
+
+    search_context = "\n\n".join(context_blocks) if context_blocks else "No results found."
+
+    prompt = f"""You are an elite research analyst powered by Gemma 4 31B.
+Current Date: {today_str}
+Research Topic: {topic}
+
+Below are live internet search results gathered moments ago:
+{search_context}
+
+Write a comprehensive, high-signal HTML research briefing on this topic based strictly on the search results above.
+Requirements:
+1. Structure your output using clean HTML fragments (`<h2>`, `<h3>`, `<p>`, `<ul>`, `<li>`, `<strong>`, `<a href="...">`). Do NOT wrap in `<html>`, `<head>`, or `<body>` tags, and do NOT use markdown code fences (```html).
+2. Include these sections:
+   - **Executive Summary**: 3-4 bullet points of the biggest takeaways right now.
+   - **Key Developments & Deep Dive**: Thematic breakdown of concrete facts, numbers, and events.
+   - **Actionable Watchlist / Implications**: What to monitor next.
+   - **Sources**: Inline clickable links (`<a href="URL" style="color: #38bdf8;">Source Title</a>`) citing the exact URLs from the search results.
+"""
+    print("🧠 Step 3: Synthesizing executive report with Gemma 4 31B (MTP)...")
+    raw_html = ask_gemma(
+        [{"role": "user", "content": prompt}], temperature=0.3, max_tokens=2048
+    )
+    # Strip markdown code fences if the model included them
+    raw_html = re.sub(r"^```(?:html)?\s*", "", raw_html.strip(), flags=re.IGNORECASE)
+    raw_html = re.sub(r"\s*```$", "", raw_html.strip())
+    return raw_html
+
+
+def wrap_in_email_template(topic: str, queries: List[str], body_html: str) -> str:
+    """Wraps the Gemma 4 HTML briefing in a clean dark-mode email card."""
+    now_str = datetime.now().strftime("%b %d, %Y • %I:%M %p EST")
+    queries_pills = "".join(
+        f'<span style="display:inline-block; background:#1e293b; color:#38bdf8; '
+        f'padding:4px 10px; border-radius:999px; font-size:12px; margin:3px 4px 3px 0; '
+        f'border:1px solid #334155;">🔎 {q}</span>'
+        for q in queries
+    )
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #0b0f19; color: #e2e8f0; margin: 0; padding: 24px; }}
+    h2 {{ color: #38bdf8; border-bottom: 1px solid #334155; padding-bottom: 8px; margin-top: 24px; font-size: 18px; }}
+    h3 {{ color: #f8fafc; margin-top: 18px; font-size: 15px; }}
+    p, li {{ color: #cbd5e1; line-height: 1.6; font-size: 14px; }}
+    ul {{ padding-left: 20px; }}
+    li {{ margin-bottom: 8px; }}
+    a {{ color: #38bdf8; text-decoration: none; }}
+  </style>
+</head>
+<body>
+  <div style="max-width: 760px; margin: 0 auto; background-color: #1e293b; border-radius: 12px; overflow: hidden; border: 1px solid #334155;">
+    <div style="padding: 24px; background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); border-bottom: 1px solid #334155;">
+      <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px; color: #38bdf8; font-weight: 700;">
+        Gemma 4 31B • Agentic Web Research Briefing
+      </div>
+      <h1 style="margin: 8px 0 4px 0; font-size: 20px; color: #f8fafc;">{topic}</h1>
+      <div style="font-size: 12px; color: #94a3b8;">Generated {now_str}</div>
+      <div style="margin-top: 12px;">{queries_pills}</div>
+    </div>
+    <div style="padding: 24px; background-color: #0f172a;">
+      {body_html}
+    </div>
+    <div style="padding: 14px 24px; background-color: #090d16; border-top: 1px solid #334155; text-align: center; font-size: 11px; color: #64748b;">
+      Dispatched to <strong>{os.getenv('ALERT_EMAIL_TO', 'erfontes@gmail.com')}</strong> • Powered by local Gemma 4 31B (MTP Speculative Decoding)
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+# ==============================================================================
+# 6. Email Dispatcher (Reuses /home/erfontes/research/trader/.env)
+# ==============================================================================
+def send_email_report(subject: str, html_content: str, recipient: str = None) -> bool:
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_pass = os.getenv("SMTP_PASSWORD")
+    sender = os.getenv("ALERT_EMAIL_FROM", smtp_user)
+    recipient = recipient or os.getenv("ALERT_EMAIL_TO", "erfontes@gmail.com")
+
+    out_file = os.path.join(BASE_DIR, "latest_search_briefing.html")
+    with open(out_file, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    print(f"📄 Saved HTML research report to: {out_file}")
+
+    if not smtp_host or not smtp_user or not smtp_pass or not recipient:
+        print("⚠️ SMTP credentials missing in .env; skipped email send.")
+        return False
+
+    print(f"📧 Sending email to {recipient} via {smtp_host}:{smtp_port}...")
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = sender
+        msg["To"] = recipient
+        msg.attach(MIMEText(html_content, "html"))
+
+        use_tls = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=25) as server:
+            if use_tls:
+                server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(sender, [recipient], msg.as_string())
+
+        print(f"✅ Email successfully sent to {recipient}!")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to send email: {e}")
+        return False
+
+
+# ==============================================================================
+# 7. CLI Entrypoint
+# ==============================================================================
+def main():
+    parser = argparse.ArgumentParser(
+        description="Gemma 4 31B Agentic Web Search & Email Briefing"
+    )
+    parser.add_argument(
+        "--topic",
+        "-t",
+        type=str,
+        default=DEFAULT_TOPICS,
+        help="Research topic or question for Gemma 4 to investigate.",
+    )
+    parser.add_argument(
+        "--queries",
+        "-q",
+        type=int,
+        default=4,
+        help="Number of search queries Gemma 4 should generate (default: 4).",
+    )
+    parser.add_argument(
+        "--results-per-query",
+        "-r",
+        type=int,
+        default=4,
+        help="Max search results per query (default: 4).",
+    )
+    parser.add_argument(
+        "--timelimit",
+        type=str,
+        default="w",
+        choices=["d", "w", "m", "y"],
+        help="Search recency filter: d (day), w (week), m (month), y (year).",
+    )
+    parser.add_argument(
+        "--to",
+        type=str,
+        default=None,
+        help="Override recipient email address (defaults to ALERT_EMAIL_TO in .env).",
+    )
+    parser.add_argument(
+        "--no-email",
+        action="store_true",
+        help="Run search and save HTML locally without sending email.",
+    )
+    args = parser.parse_args()
+
+    print("=" * 76)
+    print(f"🚀 GEMMA 4 SEARCH AGENT | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"📌 Topic: {args.topic}")
+    print("=" * 76)
+
+    with GemmaServerContext():
+        queries = plan_search_queries(args.topic, num_queries=args.queries)
+        print(f"📋 Planned Queries ({len(queries)}):")
+        for i, q in enumerate(queries, 1):
+            print(f"   {i}. {q}")
+
+        print("\n🌐 Step 2: Executing live web & news searches...")
+        results = execute_searches(
+            queries,
+            max_results_per_query=args.results_per_query,
+            timelimit=args.timelimit,
+            deep_scrape=True,
+        )
+        print(f"✅ Collected {len(results)} unique sources.")
+
+        body_html = synthesize_briefing(args.topic, results)
+        full_html = wrap_in_email_template(args.topic, queries, body_html)
+
+    if args.no_email:
+        out_file = os.path.join(BASE_DIR, "latest_search_briefing.html")
+        with open(out_file, "w", encoding="utf-8") as f:
+            f.write(full_html)
+        print(f"📄 Dry-run complete. Report saved to: {out_file}")
+    else:
+        short_topic = args.topic[:55] + ("..." if len(args.topic) > 55 else "")
+        subject = f"🔍 Gemma 4 Research Briefing: {short_topic} ({date.today().strftime('%b %d')})"
+        send_email_report(subject, full_html, recipient=args.to)
+
+
+if __name__ == "__main__":
+    main()
