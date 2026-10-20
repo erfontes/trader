@@ -55,12 +55,6 @@ def load_env_file():
 load_env_file()
 
 GEMMA4_URL = os.getenv("GEMMA4_SERVER_URL", "http://127.0.0.1:11434")
-GEMMA4_PYTHON = os.getenv(
-    "GEMMA4_PYTHON_PATH", "/home/erfontes/miniconda3/envs/vel/bin/python"
-)
-GEMMA4_SCRIPT = os.getenv(
-    "GEMMA4_SCRIPT_PATH", os.path.join(BASE_DIR, "gemma4_server.py")
-)
 MODEL_NAME = os.getenv("GEMMA4_MODEL_NAME", "gemma4:31b")
 
 DEFAULT_TOPICS = os.getenv(
@@ -70,89 +64,25 @@ DEFAULT_TOPICS = os.getenv(
 
 
 # ==============================================================================
-# 2. Gemma 4 Server Lifecycle Manager (MTP Speculative Decoding Server)
+# 2. Gemma 4 Server Connection Check (Uses Existing Running Server Only)
 # ==============================================================================
-def is_gemma_server_running(url: str = GEMMA4_URL, timeout: float = 3.0) -> bool:
+def ensure_gemma_server_online(url: str = GEMMA4_URL, timeout: float = 5.0) -> None:
+    """Checks that the existing Gemma 4 server is online without ever spawning a second process."""
     try:
         r = requests.get(f"{url}/health", timeout=timeout)
-        if r.status_code == 200:
-            return r.json().get("status") == "online"
-    except Exception:
-        return False
-    return False
-
-
-def wait_for_gemma_server(url: str = GEMMA4_URL, max_wait_sec: int = 150) -> bool:
-    print(f"⏳ Waiting up to {max_wait_sec}s for Gemma 4 MTP server to load...")
-    start = time.time()
-    while time.time() - start < max_wait_sec:
-        if is_gemma_server_running(url, timeout=2.0):
-            print(f"✅ Gemma 4 server is online after {time.time() - start:.1f}s!")
-            return True
-        time.sleep(2.5)
-    print("❌ Timed out waiting for Gemma 4 server to start.")
-    return False
-
-
-class GemmaServerContext:
-    """
-    Ensures gemma4_server.py is running.
-    If already online, uses the existing instance and leaves it running.
-    If offline, launches it via `/home/erfontes/miniconda3/envs/vel/bin/python`
-    and cleanly shuts it down on exit.
-    """
-
-    def __init__(
-        self,
-        url: str = GEMMA4_URL,
-        py_path: str = GEMMA4_PYTHON,
-        script_path: str = GEMMA4_SCRIPT,
-    ):
-        self.url = url
-        self.py_path = py_path
-        self.script_path = script_path
-        self.proc = None
-        self.started_by_us = False
-
-    def __enter__(self):
-        if is_gemma_server_running(self.url):
-            print(f"🚀 Gemma 4 MTP server is already online at {self.url}.")
-            self.started_by_us = False
-            return self
-
-        print(f"⚡ Gemma 4 server is offline. Launching via {self.py_path}...")
-        log_path = os.path.join(BASE_DIR, "gemma4_search_server.log")
-        log_file = open(log_path, "w", encoding="utf-8")
-        self.proc = subprocess.Popen(
-            [self.py_path, self.script_path],
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            cwd=BASE_DIR,
-            preexec_fn=os.setsid,
+        if r.status_code == 200 and r.json().get("status") == "online":
+            gpu = r.json().get("gpu", {})
+            print(
+                f"🚀 Connected to running Gemma 4 MTP server at {url} "
+                f"(VRAM: {gpu.get('allocated_gb', '?')}/{gpu.get('total_gb', '?')} GB)"
+            )
+            return
+    except Exception as e:
+        raise RuntimeError(
+            f"Gemma 4 server is not reachable at {url}/health ({e}). "
+            f"Please ensure gemma4_server.py is running."
         )
-        self.started_by_us = True
-
-        if not wait_for_gemma_server(self.url, max_wait_sec=150):
-            self.cleanup()
-            raise RuntimeError("Failed to start Gemma 4 inference server.")
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.started_by_us:
-            self.cleanup()
-
-    def cleanup(self):
-        if self.proc and self.proc.poll() is None:
-            print("🛑 Stopping temporary Gemma 4 server and releasing GPU VRAM...")
-            try:
-                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
-                self.proc.wait(timeout=15)
-            except Exception:
-                try:
-                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
-                except Exception:
-                    pass
-            print("✅ Gemma 4 server stopped.")
+    raise RuntimeError(f"Gemma 4 server at {url} is not ready.")
 
 
 # ==============================================================================
@@ -161,7 +91,7 @@ class GemmaServerContext:
 def ask_gemma(
     messages: List[Dict[str, str]],
     temperature: float = 0.3,
-    max_tokens: int = 1536,
+    max_tokens: int = 1024,
 ) -> str:
     """Calls the /v1/chat/completions endpoint on gemma4_server.py."""
     payload = {
@@ -181,7 +111,7 @@ def ask_gemma(
 # ==============================================================================
 # 4. Web & News Search + Page Excerpt Extraction
 # ==============================================================================
-def fetch_page_excerpt(url: str, max_chars: int = 1200) -> str:
+def fetch_page_excerpt(url: str, max_chars: int = 600) -> str:
     """Fetches a brief clean-text excerpt from a web URL to enrich search snippets."""
     try:
         headers = {
@@ -313,7 +243,7 @@ def synthesize_briefing(topic: str, results: List[Dict[str, str]]) -> str:
     """Passes gathered search evidence to Gemma 4 to write an HTML executive briefing."""
     today_str = date.today().strftime("%B %d, %Y")
     context_blocks = []
-    for idx, r in enumerate(results[:18], 1):
+    for idx, r in enumerate(results[:10], 1):
         block = (
             f"[{idx}] Title: {r['title']}\n"
             f"    Source: {r['source']} | Date: {r.get('date', 'Recent')}\n"
@@ -344,7 +274,7 @@ Requirements:
 """
     print("🧠 Step 3: Synthesizing executive report with Gemma 4 31B (MTP)...")
     raw_html = ask_gemma(
-        [{"role": "user", "content": prompt}], temperature=0.3, max_tokens=2048
+        [{"role": "user", "content": prompt}], temperature=0.3, max_tokens=1024
     )
     # Strip markdown code fences if the model included them
     raw_html = re.sub(r"^```(?:html)?\s*", "", raw_html.strip(), flags=re.IGNORECASE)
@@ -491,23 +421,23 @@ def main():
     print(f"📌 Topic: {args.topic}")
     print("=" * 76)
 
-    with GemmaServerContext():
-        queries = plan_search_queries(args.topic, num_queries=args.queries)
-        print(f"📋 Planned Queries ({len(queries)}):")
-        for i, q in enumerate(queries, 1):
-            print(f"   {i}. {q}")
+    ensure_gemma_server_online()
+    queries = plan_search_queries(args.topic, num_queries=args.queries)
+    print(f"📋 Planned Queries ({len(queries)}):")
+    for i, q in enumerate(queries, 1):
+        print(f"   {i}. {q}")
 
-        print("\n🌐 Step 2: Executing live web & news searches...")
-        results = execute_searches(
-            queries,
-            max_results_per_query=args.results_per_query,
-            timelimit=args.timelimit,
-            deep_scrape=True,
-        )
-        print(f"✅ Collected {len(results)} unique sources.")
+    print("\n🌐 Step 2: Executing live web & news searches...")
+    results = execute_searches(
+        queries,
+        max_results_per_query=args.results_per_query,
+        timelimit=args.timelimit,
+        deep_scrape=True,
+    )
+    print(f"✅ Collected {len(results)} unique sources.")
 
-        body_html = synthesize_briefing(args.topic, results)
-        full_html = wrap_in_email_template(args.topic, queries, body_html)
+    body_html = synthesize_briefing(args.topic, results)
+    full_html = wrap_in_email_template(args.topic, queries, body_html)
 
     if args.no_email:
         out_file = os.path.join(BASE_DIR, "latest_search_briefing.html")

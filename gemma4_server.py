@@ -171,19 +171,20 @@ async def chat_completions(request: ChatCompletionRequest):
             gen_kwargs["temperature"] = request.temperature
 
         start_time = time.time()
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = target_model.generate(**inputs, **gen_kwargs)
         generation_time = time.time() - start_time
 
         input_len = inputs["input_ids"].shape[1]
-        del inputs
-        torch.cuda.empty_cache()
+        total_tokens = len(outputs[0])
+        completion_tokens = total_tokens - input_len
+        prompt_tokens = input_len
 
         response_text = processor.decode(outputs[0][input_len:], skip_special_tokens=True)
 
-        prompt_tokens = input_len
-        completion_tokens = len(outputs[0]) - input_len
-        total_tokens = len(outputs[0])
+        del inputs, outputs
+        gc.collect()
+        torch.cuda.empty_cache()
 
         tok_per_sec = completion_tokens / generation_time if generation_time > 0 else 0
         print(f"[OpenAI Endpoint] Generated {completion_tokens} tokens in {generation_time:.2f}s ({tok_per_sec:.2f} tok/s)")
@@ -208,6 +209,9 @@ async def chat_completions(request: ChatCompletionRequest):
             }
         }
     except Exception as e:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         print(f"❌ Error during generation: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -254,18 +258,19 @@ async def api_generate(request: GenerateRequest):
             gen_kwargs["temperature"] = temp
 
         start_time = time.time()
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = target_model.generate(**inputs, **gen_kwargs)
         generation_time = time.time() - start_time
 
         input_len = inputs["input_ids"].shape[1]
-        del inputs
-        torch.cuda.empty_cache()
+        completion_tokens = len(outputs[0]) - input_len
+        prompt_tokens = input_len
 
         response_text = processor.decode(outputs[0][input_len:], skip_special_tokens=True)
 
-        prompt_tokens = input_len
-        completion_tokens = len(outputs[0]) - input_len
+        del inputs, outputs
+        gc.collect()
+        torch.cuda.empty_cache()
 
         tok_per_sec = completion_tokens / generation_time if generation_time > 0 else 0
         print(f"[Ollama Endpoint] Generated {completion_tokens} tokens in {generation_time:.2f}s ({tok_per_sec:.2f} tok/s)")
@@ -281,6 +286,9 @@ async def api_generate(request: GenerateRequest):
             "eval_count": completion_tokens
         }
     except Exception as e:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         print(f"❌ Error during generation: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
