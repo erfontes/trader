@@ -2,6 +2,11 @@ import os
 import sys
 import gc
 import time
+import asyncio
+
+# Prevent CUDA memory fragmentation and allow expandable segments
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import uvicorn
 from contextlib import asynccontextmanager
@@ -17,10 +22,16 @@ from transformers import AutoProcessor, AutoModelForCausalLM, BitsAndBytesConfig
 TARGET_MODEL_ID = os.getenv("GEMMA4_TARGET_MODEL", "unsloth/gemma-4-31B-it-unsloth-bnb-4bit")
 ASSISTANT_MODEL_ID = os.getenv("GEMMA4_ASSISTANT_MODEL", "google/gemma-4-31B-it-assistant")
 
-# Global model state
+# Hard safety caps to guarantee ~2 GB of free VRAM on a 24GB GPU
+VRAM_MEMORY_FRACTION = float(os.getenv("GEMMA4_VRAM_FRACTION", "0.90"))  # Max 90% (~21.6 GB) for PyTorch, leaves ~2.4 GB free
+MAX_INPUT_TOKENS = int(os.getenv("GEMMA4_MAX_INPUT_TOKENS", "3072"))
+MAX_NEW_TOKENS_CAP = int(os.getenv("GEMMA4_MAX_NEW_TOKENS", "1024"))
+
+# Global model state & concurrency lock (prevents overlapping KV-caches)
 processor = None
 target_model = None
 assistant_model = None
+inference_lock = asyncio.Lock()
 
 
 @asynccontextmanager
@@ -34,9 +45,10 @@ async def lifespan(app: FastAPI):
     print(f"PyTorch Version: {torch.__version__}")
     print(f"CUDA Available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(VRAM_MEMORY_FRACTION, 0)
         print(f"Device: {torch.cuda.get_device_name(0)}")
         total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        print(f"Available VRAM: {total_vram_gb:.2f} GB")
+        print(f"Available VRAM: {total_vram_gb:.2f} GB (Capped at {VRAM_MEMORY_FRACTION*100:.0f}% = {total_vram_gb*VRAM_MEMORY_FRACTION:.2f} GB to keep ~{total_vram_gb*(1-VRAM_MEMORY_FRACTION):.1f} GB free)")
     print(f"Target Model: {TARGET_MODEL_ID}")
     print(f"Assistant Model: {ASSISTANT_MODEL_ID}")
     print("====================================================================")
@@ -156,64 +168,71 @@ async def chat_completions(request: ChatCompletionRequest):
     if not target_model or not assistant_model or not processor:
         raise HTTPException(status_code=503, detail="Models not loaded yet.")
 
-    try:
-        formatted_messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
-        input_text = processor.apply_chat_template(formatted_messages, tokenize=False, add_generation_prompt=True)
-        inputs = processor(text=input_text, return_tensors="pt").to(target_model.device)
+    async with inference_lock:
+        try:
+            formatted_messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+            input_text = processor.apply_chat_template(formatted_messages, tokenize=False, add_generation_prompt=True)
+            inputs = processor(
+                text=input_text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=MAX_INPUT_TOKENS
+            ).to(target_model.device)
 
-        do_sample = request.temperature is not None and request.temperature > 0
-        gen_kwargs = {
-            "max_new_tokens": request.max_tokens if request.max_tokens else 512,
-            "do_sample": do_sample,
-            "assistant_model": assistant_model,
-        }
-        if do_sample:
-            gen_kwargs["temperature"] = request.temperature
-
-        start_time = time.time()
-        with torch.inference_mode():
-            outputs = target_model.generate(**inputs, **gen_kwargs)
-        generation_time = time.time() - start_time
-
-        input_len = inputs["input_ids"].shape[1]
-        total_tokens = len(outputs[0])
-        completion_tokens = total_tokens - input_len
-        prompt_tokens = input_len
-
-        response_text = processor.decode(outputs[0][input_len:], skip_special_tokens=True)
-
-        del inputs, outputs
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        tok_per_sec = completion_tokens / generation_time if generation_time > 0 else 0
-        print(f"[OpenAI Endpoint] Generated {completion_tokens} tokens in {generation_time:.2f}s ({tok_per_sec:.2f} tok/s)")
-
-        return {
-            "id": f"chatcmpl-{int(time.time())}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": request.model,
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": response_text
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": total_tokens
+            do_sample = request.temperature is not None and request.temperature > 0
+            requested_tokens = request.max_tokens if request.max_tokens else 512
+            gen_kwargs = {
+                "max_new_tokens": min(requested_tokens, MAX_NEW_TOKENS_CAP),
+                "do_sample": do_sample,
+                "assistant_model": assistant_model,
             }
-        }
-    except Exception as e:
-        gc.collect()
-        if torch.cuda.is_available():
+            if do_sample:
+                gen_kwargs["temperature"] = request.temperature
+
+            start_time = time.time()
+            with torch.inference_mode():
+                outputs = target_model.generate(**inputs, **gen_kwargs)
+            generation_time = time.time() - start_time
+
+            input_len = inputs["input_ids"].shape[1]
+            total_tokens = len(outputs[0])
+            completion_tokens = total_tokens - input_len
+            prompt_tokens = input_len
+
+            response_text = processor.decode(outputs[0][input_len:], skip_special_tokens=True)
+
+            del inputs, outputs
+            gc.collect()
             torch.cuda.empty_cache()
-        print(f"❌ Error during generation: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+
+            tok_per_sec = completion_tokens / generation_time if generation_time > 0 else 0
+            print(f"[OpenAI Endpoint] Generated {completion_tokens} tokens in {generation_time:.2f}s ({tok_per_sec:.2f} tok/s)")
+
+            return {
+                "id": f"chatcmpl-{int(time.time())}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": response_text
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens
+                }
+            }
+        except Exception as e:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(f"❌ Error during generation: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==============================================================================
@@ -233,64 +252,70 @@ async def api_generate(request: GenerateRequest):
     if not target_model or not assistant_model or not processor:
         raise HTTPException(status_code=503, detail="Models not loaded yet.")
 
-    try:
-        # Wrap prompt in standard Gemma chat structure
-        formatted_messages = [{"role": "user", "content": request.prompt}]
-        input_text = processor.apply_chat_template(formatted_messages, tokenize=False, add_generation_prompt=True)
-        inputs = processor(text=input_text, return_tensors="pt").to(target_model.device)
+    async with inference_lock:
+        try:
+            # Wrap prompt in standard Gemma chat structure
+            formatted_messages = [{"role": "user", "content": request.prompt}]
+            input_text = processor.apply_chat_template(formatted_messages, tokenize=False, add_generation_prompt=True)
+            inputs = processor(
+                text=input_text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=MAX_INPUT_TOKENS
+            ).to(target_model.device)
 
-        # Parse Ollama options
-        temp = 0.7
-        num_predict = 512
-        if request.options:
-            if "temperature" in request.options:
-                temp = float(request.options["temperature"])
-            if "num_predict" in request.options:
-                num_predict = int(request.options["num_predict"])
+            # Parse Ollama options
+            temp = 0.7
+            num_predict = 512
+            if request.options:
+                if "temperature" in request.options:
+                    temp = float(request.options["temperature"])
+                if "num_predict" in request.options:
+                    num_predict = int(request.options["num_predict"])
 
-        do_sample = temp > 0
-        gen_kwargs = {
-            "max_new_tokens": num_predict,
-            "do_sample": do_sample,
-            "assistant_model": assistant_model,
-        }
-        if do_sample:
-            gen_kwargs["temperature"] = temp
+            do_sample = temp > 0
+            gen_kwargs = {
+                "max_new_tokens": min(num_predict, MAX_NEW_TOKENS_CAP),
+                "do_sample": do_sample,
+                "assistant_model": assistant_model,
+            }
+            if do_sample:
+                gen_kwargs["temperature"] = temp
 
-        start_time = time.time()
-        with torch.inference_mode():
-            outputs = target_model.generate(**inputs, **gen_kwargs)
-        generation_time = time.time() - start_time
+            start_time = time.time()
+            with torch.inference_mode():
+                outputs = target_model.generate(**inputs, **gen_kwargs)
+            generation_time = time.time() - start_time
 
-        input_len = inputs["input_ids"].shape[1]
-        completion_tokens = len(outputs[0]) - input_len
-        prompt_tokens = input_len
+            input_len = inputs["input_ids"].shape[1]
+            completion_tokens = len(outputs[0]) - input_len
+            prompt_tokens = input_len
 
-        response_text = processor.decode(outputs[0][input_len:], skip_special_tokens=True)
+            response_text = processor.decode(outputs[0][input_len:], skip_special_tokens=True)
 
-        del inputs, outputs
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        tok_per_sec = completion_tokens / generation_time if generation_time > 0 else 0
-        print(f"[Ollama Endpoint] Generated {completion_tokens} tokens in {generation_time:.2f}s ({tok_per_sec:.2f} tok/s)")
-
-        return {
-            "model": request.model,
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "response": response_text,
-            "done": True,
-            "context": [],
-            "total_duration": int(generation_time * 1e9),
-            "prompt_eval_count": prompt_tokens,
-            "eval_count": completion_tokens
-        }
-    except Exception as e:
-        gc.collect()
-        if torch.cuda.is_available():
+            del inputs, outputs
+            gc.collect()
             torch.cuda.empty_cache()
-        print(f"❌ Error during generation: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+
+            tok_per_sec = completion_tokens / generation_time if generation_time > 0 else 0
+            print(f"[Ollama Endpoint] Generated {completion_tokens} tokens in {generation_time:.2f}s ({tok_per_sec:.2f} tok/s)")
+
+            return {
+                "model": request.model,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "response": response_text,
+                "done": True,
+                "context": [],
+                "total_duration": int(generation_time * 1e9),
+                "prompt_eval_count": prompt_tokens,
+                "eval_count": completion_tokens
+            }
+        except Exception as e:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(f"❌ Error during generation: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==============================================================================

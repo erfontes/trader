@@ -136,43 +136,21 @@ def fetch_page_excerpt(url: str, max_chars: int = 600) -> str:
 def execute_searches(
     queries: List[str],
     max_results_per_query: int = 4,
-    timelimit: str = "w",
+    timelimit: str = None,
     deep_scrape: bool = True,
 ) -> List[Dict[str, str]]:
     """Runs both News and Web searches via DuckDuckGo and deduplicates URLs."""
     ddgs = DDGS()
     collected: List[Dict[str, str]] = []
     seen_urls = set()
+    tl = None if timelimit in (None, "all", "") else timelimit
 
     for q in queries:
         print(f"  🔎 Searching: '{q}'...")
-        # 1. Recent news search
-        try:
-            news_hits = ddgs.news(
-                q, max_results=max_results_per_query, timelimit=timelimit
-            )
-            for item in news_hits or []:
-                url = item.get("url") or item.get("href", "")
-                if not url or url in seen_urls:
-                    continue
-                seen_urls.add(url)
-                collected.append(
-                    {
-                        "query": q,
-                        "title": item.get("title", "Untitled"),
-                        "url": url,
-                        "source": item.get("source", "News"),
-                        "date": item.get("date", ""),
-                        "snippet": item.get("body", ""),
-                    }
-                )
-        except Exception as e:
-            print(f"    ⚠️ News search warning for '{q}': {e}")
-
-        # 2. General web search
+        # 1. General web search (prioritized for product/store pages)
         try:
             web_hits = ddgs.text(
-                q, max_results=max_results_per_query, timelimit=timelimit
+                q, max_results=max_results_per_query, timelimit=tl
             )
             for item in web_hits or []:
                 url = item.get("href") or item.get("url", "")
@@ -191,6 +169,29 @@ def execute_searches(
                 )
         except Exception as e:
             print(f"    ⚠️ Web search warning for '{q}': {e}")
+
+        # 2. Recent news search
+        try:
+            news_hits = ddgs.news(
+                q, max_results=max(2, max_results_per_query // 2), timelimit=tl
+            )
+            for item in news_hits or []:
+                url = item.get("url") or item.get("href", "")
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                collected.append(
+                    {
+                        "query": q,
+                        "title": item.get("title", "Untitled"),
+                        "url": url,
+                        "source": item.get("source", "News"),
+                        "date": item.get("date", ""),
+                        "snippet": item.get("body", ""),
+                    }
+                )
+        except Exception as e:
+            print(f"    ⚠️ News search warning for '{q}': {e}")
 
     # Enrich top results with scraped article body text
     if deep_scrape and collected:
@@ -240,41 +241,36 @@ def plan_search_queries(topic: str, num_queries: int = 4) -> List[str]:
 
 
 def synthesize_briefing(topic: str, results: List[Dict[str, str]]) -> str:
-    """Passes gathered search evidence to Gemma 4 to write an HTML executive briefing."""
+    """Passes gathered search evidence to Gemma 4 to write a friendly, casual deal summary."""
     today_str = date.today().strftime("%B %d, %Y")
     context_blocks = []
     for idx, r in enumerate(results[:10], 1):
         block = (
             f"[{idx}] Title: {r['title']}\n"
-            f"    Source: {r['source']} | Date: {r.get('date', 'Recent')}\n"
             f"    URL: {r['url']}\n"
             f"    Snippet: {r['snippet']}"
         )
         if r.get("excerpt"):
-            block += f"\n    Article Excerpt: {r['excerpt']}"
+            block += f"\n    Page Text: {r['excerpt']}"
         context_blocks.append(block)
 
     search_context = "\n\n".join(context_blocks) if context_blocks else "No results found."
 
-    prompt = f"""You are an elite research analyst powered by Gemma 4 31B.
-Current Date: {today_str}
-Research Topic: {topic}
+    prompt = f"""You are helping find the best prices and store links for: {topic} (Date: {today_str}).
 
-Below are live internet search results gathered moments ago:
+Here are the search results found today:
 {search_context}
 
-Write a comprehensive, high-signal HTML research briefing on this topic based strictly on the search results above.
-Requirements:
-1. Structure your output using clean HTML fragments (`<h2>`, `<h3>`, `<p>`, `<ul>`, `<li>`, `<strong>`, `<a href="...">`). Do NOT wrap in `<html>`, `<head>`, or `<body>` tags, and do NOT use markdown code fences (```html).
-2. Include these sections:
-   - **Executive Summary**: 3-4 bullet points of the biggest takeaways right now.
-   - **Key Developments & Deep Dive**: Thematic breakdown of concrete facts, numbers, and events.
-   - **Actionable Watchlist / Implications**: What to monitor next.
-   - **Sources**: Inline clickable links (`<a href="URL" style="color: #38bdf8;">Source Title</a>`) citing the exact URLs from the search results.
+Write a short, casual, easy-to-scan HTML summary of the prices and websites found so we can quickly check the links and decide whether to buy.
+Keep it simple and informal (no corporate/analyst jargon):
+1. **Quick Price Check**: 2-3 short bullets on the lowest prices found and whether it's in stock.
+2. **Where to Buy (Stores & Links)**: A simple bulleted list of the stores/websites found, showing the price (if mentioned), a brief note on the listing, and a direct clickable link (`<a href="URL">Store / Listing Name</a>`).
+
+Use only simple HTML tags (`<h3>`, `<p>`, `<ul>`, `<li>`, `<strong>`, `<a href="...">`). Do NOT wrap in `<html>` or `<body>` tags, and do NOT use ```html code fences.
 """
-    print("🧠 Step 3: Synthesizing executive report with Gemma 4 31B (MTP)...")
+    print("🧠 Step 3: Summarizing prices and links with Gemma 4...")
     raw_html = ask_gemma(
-        [{"role": "user", "content": prompt}], temperature=0.3, max_tokens=1024
+        [{"role": "user", "content": prompt}], temperature=0.3, max_tokens=768
     )
     # Strip markdown code fences if the model included them
     raw_html = re.sub(r"^```(?:html)?\s*", "", raw_html.strip(), flags=re.IGNORECASE)
@@ -282,45 +278,28 @@ Requirements:
     return raw_html
 
 
-def wrap_in_email_template(topic: str, queries: List[str], body_html: str) -> str:
-    """Wraps the Gemma 4 HTML briefing in a clean dark-mode email card."""
-    now_str = datetime.now().strftime("%b %d, %Y • %I:%M %p EST")
-    queries_pills = "".join(
-        f'<span style="display:inline-block; background:#1e293b; color:#38bdf8; '
-        f'padding:4px 10px; border-radius:999px; font-size:12px; margin:3px 4px 3px 0; '
-        f'border:1px solid #334155;">🔎 {q}</span>'
-        for q in queries
-    )
+def wrap_in_email_template(topic: str, queries: List[str], body_html: str, recipient: str = None) -> str:
+    """Wraps the summary in a clean, simple, easy-to-read email layout."""
+    now_str = datetime.now().strftime("%b %d, %Y")
     return f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #0b0f19; color: #e2e8f0; margin: 0; padding: 24px; }}
-    h2 {{ color: #38bdf8; border-bottom: 1px solid #334155; padding-bottom: 8px; margin-top: 24px; font-size: 18px; }}
-    h3 {{ color: #f8fafc; margin-top: 18px; font-size: 15px; }}
-    p, li {{ color: #cbd5e1; line-height: 1.6; font-size: 14px; }}
-    ul {{ padding-left: 20px; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color: #1e293b; background-color: #f8fafc; margin: 0; padding: 16px; }}
+    h3 {{ color: #0f172a; margin-top: 18px; margin-bottom: 8px; font-size: 16px; }}
+    p, li {{ color: #334155; line-height: 1.5; font-size: 14px; }}
+    ul {{ padding-left: 20px; margin-top: 6px; }}
     li {{ margin-bottom: 8px; }}
-    a {{ color: #38bdf8; text-decoration: none; }}
+    a {{ color: #2563eb; text-decoration: underline; font-weight: 500; }}
   </style>
 </head>
 <body>
-  <div style="max-width: 760px; margin: 0 auto; background-color: #1e293b; border-radius: 12px; overflow: hidden; border: 1px solid #334155;">
-    <div style="padding: 24px; background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); border-bottom: 1px solid #334155;">
-      <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px; color: #38bdf8; font-weight: 700;">
-        Gemma 4 31B • Agentic Web Research Briefing
-      </div>
-      <h1 style="margin: 8px 0 4px 0; font-size: 20px; color: #f8fafc;">{topic}</h1>
-      <div style="font-size: 12px; color: #94a3b8;">Generated {now_str}</div>
-      <div style="margin-top: 12px;">{queries_pills}</div>
-    </div>
-    <div style="padding: 24px; background-color: #0f172a;">
-      {body_html}
-    </div>
-    <div style="padding: 14px 24px; background-color: #090d16; border-top: 1px solid #334155; text-align: center; font-size: 11px; color: #64748b;">
-      Dispatched to <strong>{os.getenv('ALERT_EMAIL_TO', 'erfontes@gmail.com')}</strong> • Powered by local Gemma 4 31B (MTP Speculative Decoding)
-    </div>
+  <div style="max-width: 640px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; padding: 20px; border: 1px solid #e2e8f0;">
+    <h2 style="margin: 0 0 4px 0; font-size: 18px; color: #0f172a;">🏷️ Deal & Price Update ({now_str})</h2>
+    <p style="margin: 0 0 16px 0; font-size: 13px; color: #64748b;">Search: {topic}</p>
+    <hr style="border: none; border-top: 1px solid #e2e8f0; margin-bottom: 16px;">
+    {body_html}
   </div>
 </body>
 </html>"""
@@ -399,9 +378,9 @@ def main():
     parser.add_argument(
         "--timelimit",
         type=str,
-        default="w",
-        choices=["d", "w", "m", "y"],
-        help="Search recency filter: d (day), w (week), m (month), y (year).",
+        default=None,
+        choices=["d", "w", "m", "y", "all"],
+        help="Search recency filter: d (day), w (week), m (month), y (year), or all (no limit).",
     )
     parser.add_argument(
         "--to",
@@ -437,7 +416,8 @@ def main():
     print(f"✅ Collected {len(results)} unique sources.")
 
     body_html = synthesize_briefing(args.topic, results)
-    full_html = wrap_in_email_template(args.topic, queries, body_html)
+    recipient_display = args.to or os.getenv("ALERT_EMAIL_TO", "erfontes@gmail.com")
+    full_html = wrap_in_email_template(args.topic, queries, body_html, recipient_display)
 
     if args.no_email:
         out_file = os.path.join(BASE_DIR, "latest_search_briefing.html")
@@ -446,7 +426,7 @@ def main():
         print(f"📄 Dry-run complete. Report saved to: {out_file}")
     else:
         short_topic = args.topic[:55] + ("..." if len(args.topic) > 55 else "")
-        subject = f"🔍 Gemma 4 Research Briefing: {short_topic} ({date.today().strftime('%b %d')})"
+        subject = f"🏷️ Price & Link Check: {short_topic} ({date.today().strftime('%b %d')})"
         send_email_report(subject, full_html, recipient=args.to)
 
 
