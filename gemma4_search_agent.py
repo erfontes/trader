@@ -205,6 +205,129 @@ def execute_searches(
 
 
 # ==============================================================================
+# 4B. Direct Lowes Foods Weekly Ad Product Extractor (Flipp Digital Circular API)
+# ==============================================================================
+LOWES_FLIPP_TOKEN = "07da9af5b839c91b8ebca4cee1c162e4"
+
+
+def fetch_lowes_foods_circular(postal_code: str = "27601", store_code: str = "185") -> Dict[str, Any]:
+    """
+    Pulls the actual live product items (Meat, Chicken, Seafood, BOGOs, Digital Coupons)
+    directly from the official Lowes Foods Weekly Ad API.
+    """
+    pub_url = (
+        f"https://dam.flippenterprise.net/flyerkit/publications/fflowesfoods"
+        f"?locale=en&access_token={LOWES_FLIPP_TOKEN}&show_storefronts=true"
+        f"&postal_code={postal_code}&store_code={store_code}"
+    )
+    pubs = requests.get(pub_url, timeout=15).json()
+    if not pubs:
+        raise RuntimeError("No active Lowes Foods weekly circular found.")
+
+    pub = pubs[0]
+    pub_id = pub["id"]
+    valid_from = pub.get("valid_from", "")
+    valid_to = pub.get("valid_to", "")
+
+    prod_url = (
+        f"https://dam.flippenterprise.net/flyerkit/publication/{pub_id}/products"
+        f"?display_type=all&locale=en&access_token={LOWES_FLIPP_TOKEN}"
+    )
+    products = requests.get(prod_url, timeout=15).json()
+
+    def format_item(p: Dict[str, Any]) -> str:
+        name = (p.get("name") or "").strip()
+        price = (p.get("price_text") or "").strip()
+        unit = (p.get("post_price_text") or "").strip()
+        story = (p.get("sale_story") or "").strip()
+        desc = (p.get("description") or "").replace("\n", " ").strip()
+
+        price_str = f"${price}" if price and not price.startswith("$") else price
+        if unit and price_str:
+            price_str = f"{price_str} ({unit})"
+        parts = [f"{name}"]
+        if price_str:
+            parts.append(f"Price: {price_str}")
+        if story:
+            parts.append(f"Deal: {story}")
+        if desc:
+            parts.append(f"({desc})")
+        return " — ".join(parts)
+
+    meat_seafood_items = []
+    heavy_discount_items = []
+
+    for p in products:
+        cats = p.get("categories") or []
+        story = (p.get("sale_story") or "").upper()
+        name_upper = (p.get("name") or "").upper()
+
+        is_meat_seafood = (
+            "Meat & Seafood" in cats
+            or any(
+                kw in name_upper
+                for kw in [
+                    "CHICKEN", "BEEF", "STEAK", "ROAST", "PORK", "BACON", "SAUSAGE",
+                    "SHRIMP", "SALMON", "CRAB", "LOBSTER", "TUNA", "COD", "CATFISH",
+                    "HALIBUT", "MAHI", "MEATBALL", "TURKEY", "FRYER"
+                ]
+            )
+        )
+        if is_meat_seafood:
+            meat_seafood_items.append(format_item(p))
+        elif any(kw in story for kw in ["BUY", "FREE", "OFF", "HALF", "BOGO", "%"]):
+            heavy_discount_items.append(format_item(p))
+
+    return {
+        "valid_from": valid_from,
+        "valid_to": valid_to,
+        "total_items": len(products),
+        "meat_seafood": meat_seafood_items,
+        "heavy_discounts": heavy_discount_items,
+    }
+
+
+def synthesize_lowes_foods_briefing(circular_data: Dict[str, Any]) -> str:
+    """Uses Gemma 4 to organize the actual Lowes Foods sale products into clear categories."""
+    valid_range = f"{circular_data['valid_from'][:10]} to {circular_data['valid_to'][:10]}"
+    meat_list = "\n".join(f"- {item}" for item in circular_data["meat_seafood"][:30])
+    discount_list = "\n".join(f"- {item}" for item in circular_data["heavy_discounts"][:22])
+
+    prompt = f"""Here are the exact items on sale right now from the official Lowes Foods Weekly Ad ({valid_range}):
+
+MEAT, CHICKEN & SEAFOOD ITEMS ON SALE:
+{meat_list}
+
+OTHER BOGO & HEAVILY DISCOUNTED ITEMS:
+{discount_list}
+
+Create a clean, casual, easy-to-scan HTML shopping list of these exact products and their prices/deals so Fabricia and I can plan our grocery trip.
+Organize the output into these exact 4 sections using `<h3>` and `<ul><li>`:
+1. **🍗 Chicken & Poultry Deals** (List all chicken/poultry items concisely with exact price/discount)
+2. **🥩 Beef, Pork & Bacon Deals** (List all steak, roast, ground beef, pork, bacon, sausage items concisely with exact price/discount)
+3. **🦐 Seafood Deals** (List all shrimp, salmon, crab, lobster, fish fillet items concisely with exact price or BOGO deal)
+4. **🔥 Top 10 BOGOs & Heavy Discounts** (Pick the top 10 best BOGO / $ Off deals from the list with exact details)
+
+Do NOT wrap in `<html>` or `<body>` tags, and do NOT use ```html code fences. Keep every single price and deal accurate to the list above!
+"""
+    print("🧠 Step 3: Formatting actual Lowes Foods sale products with Gemma 4...")
+    raw_html = ask_gemma(
+        [{"role": "user", "content": prompt}], temperature=0.2, max_tokens=950
+    )
+    raw_html = re.sub(r"^```(?:html)?\s*", "", raw_html.strip(), flags=re.IGNORECASE)
+    raw_html = re.sub(r"\s*```$", "", raw_html.strip())
+    links_footer = (
+        '<h3>🔗 Quick Links</h3>'
+        '<ul>'
+        '<li><a href="https://weeklyad.lowesfoods.com/">Lowes Foods Weekly Ad Circular</a></li>'
+        '<li><a href="https://shop.lowesfoods.com/shop/coupons">Lowes Foods Digital Coupons</a></li>'
+        '<li><a href="https://shop.lowesfoods.com/">Lowes Foods To Go (Online Shop)</a></li>'
+        '</ul>'
+    )
+    return raw_html + "\n" + links_footer
+
+
+# ==============================================================================
 # 5. Agentic Workflow: Query Planning -> Search -> Synthesis
 # ==============================================================================
 def plan_search_queries(topic: str, num_queries: int = 4) -> List[str]:
@@ -278,7 +401,9 @@ Use only simple HTML tags (`<h3>`, `<p>`, `<ul>`, `<li>`, `<strong>`, `<a href="
     return raw_html
 
 
-def wrap_in_email_template(topic: str, queries: List[str], body_html: str, recipient: str = None) -> str:
+def wrap_in_email_template(
+    topic: str, queries: List[str], body_html: str, recipient: str = None, title: str = "🏷️ Deal & Price Update"
+) -> str:
     """Wraps the summary in a clean, simple, easy-to-read email layout."""
     now_str = datetime.now().strftime("%b %d, %Y")
     return f"""<!DOCTYPE html>
@@ -296,7 +421,7 @@ def wrap_in_email_template(topic: str, queries: List[str], body_html: str, recip
 </head>
 <body>
   <div style="max-width: 640px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; padding: 20px; border: 1px solid #e2e8f0;">
-    <h2 style="margin: 0 0 4px 0; font-size: 18px; color: #0f172a;">🏷️ Deal & Price Update ({now_str})</h2>
+    <h2 style="margin: 0 0 4px 0; font-size: 18px; color: #0f172a;">{title} ({now_str})</h2>
     <p style="margin: 0 0 16px 0; font-size: 13px; color: #64748b;">Search: {topic}</p>
     <hr style="border: none; border-top: 1px solid #e2e8f0; margin-bottom: 16px;">
     {body_html}
@@ -314,23 +439,25 @@ def send_email_report(subject: str, html_content: str, recipient: str = None) ->
     smtp_user = os.getenv("SMTP_USER")
     smtp_pass = os.getenv("SMTP_PASSWORD")
     sender = os.getenv("ALERT_EMAIL_FROM", smtp_user)
-    recipient = recipient or os.getenv("ALERT_EMAIL_TO", "erfontes@gmail.com")
+    raw_recipients = recipient or os.getenv("ALERT_EMAIL_TO", "erfontes@gmail.com")
+    recipient_list = [r.strip() for r in raw_recipients.split(",") if r.strip()]
 
     out_file = os.path.join(BASE_DIR, "latest_search_briefing.html")
     with open(out_file, "w", encoding="utf-8") as f:
         f.write(html_content)
     print(f"📄 Saved HTML research report to: {out_file}")
 
-    if not smtp_host or not smtp_user or not smtp_pass or not recipient:
+    if not smtp_host or not smtp_user or not smtp_pass or not recipient_list:
         print("⚠️ SMTP credentials missing in .env; skipped email send.")
         return False
 
-    print(f"📧 Sending email to {recipient} via {smtp_host}:{smtp_port}...")
+    recipients_display = ", ".join(recipient_list)
+    print(f"📧 Sending email to {recipients_display} via {smtp_host}:{smtp_port}...")
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = sender
-        msg["To"] = recipient
+        msg["To"] = recipients_display
         msg.attach(MIMEText(html_content, "html"))
 
         use_tls = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
@@ -338,9 +465,9 @@ def send_email_report(subject: str, html_content: str, recipient: str = None) ->
             if use_tls:
                 server.starttls()
             server.login(smtp_user, smtp_pass)
-            server.sendmail(sender, [recipient], msg.as_string())
+            server.sendmail(sender, recipient_list, msg.as_string())
 
-        print(f"✅ Email successfully sent to {recipient}!")
+        print(f"✅ Email successfully sent to {recipients_display}!")
         return True
     except Exception as e:
         print(f"❌ Failed to send email: {e}")
@@ -386,7 +513,13 @@ def main():
         "--to",
         type=str,
         default=None,
-        help="Override recipient email address (defaults to ALERT_EMAIL_TO in .env).",
+        help="Override recipient email address(es), comma-separated (defaults to ALERT_EMAIL_TO in .env).",
+    )
+    parser.add_argument(
+        "--title",
+        type=str,
+        default=None,
+        help="Custom title/subject prefix (e.g., 'Smart Shopping').",
     )
     parser.add_argument(
         "--no-email",
@@ -401,23 +534,42 @@ def main():
     print("=" * 76)
 
     ensure_gemma_server_online()
-    queries = plan_search_queries(args.topic, num_queries=args.queries)
-    print(f"📋 Planned Queries ({len(queries)}):")
-    for i, q in enumerate(queries, 1):
-        print(f"   {i}. {q}")
-
-    print("\n🌐 Step 2: Executing live web & news searches...")
-    results = execute_searches(
-        queries,
-        max_results_per_query=args.results_per_query,
-        timelimit=args.timelimit,
-        deep_scrape=True,
-    )
-    print(f"✅ Collected {len(results)} unique sources.")
-
-    body_html = synthesize_briefing(args.topic, results)
     recipient_display = args.to or os.getenv("ALERT_EMAIL_TO", "erfontes@gmail.com")
-    full_html = wrap_in_email_template(args.topic, queries, body_html, recipient_display)
+    header_title = f"🛒 {args.title}" if args.title else "🏷️ Deal & Price Update"
+
+    if "lowesfoods" in args.topic.lower() or "lowes foods" in args.topic.lower():
+        print("🛒 Step 1: Fetching live Weekly Ad products directly from Lowes Foods Circular API...")
+        circular = fetch_lowes_foods_circular()
+        print(
+            f"✅ Pulled {circular['total_items']} total ad items "
+            f"({len(circular['meat_seafood'])} Meat/Chicken/Seafood, "
+            f"{len(circular['heavy_discounts'])} BOGO/Heavy Discounts) "
+            f"valid {circular['valid_from']} to {circular['valid_to']}."
+        )
+        body_html = synthesize_lowes_foods_briefing(circular)
+        topic_label = f"Lowes Foods Weekly Ad ({circular['valid_from']} to {circular['valid_to']}) — Meat, Chicken, Seafood & BOGOs"
+        full_html = wrap_in_email_template(
+            topic_label, [], body_html, recipient_display, title=header_title
+        )
+    else:
+        queries = plan_search_queries(args.topic, num_queries=args.queries)
+        print(f"📋 Planned Queries ({len(queries)}):")
+        for i, q in enumerate(queries, 1):
+            print(f"   {i}. {q}")
+
+        print("\n🌐 Step 2: Executing live web & news searches...")
+        results = execute_searches(
+            queries,
+            max_results_per_query=args.results_per_query,
+            timelimit=args.timelimit,
+            deep_scrape=True,
+        )
+        print(f"✅ Collected {len(results)} unique sources.")
+
+        body_html = synthesize_briefing(args.topic, results)
+        full_html = wrap_in_email_template(
+            args.topic, queries, body_html, recipient_display, title=header_title
+        )
 
     if args.no_email:
         out_file = os.path.join(BASE_DIR, "latest_search_briefing.html")
@@ -425,8 +577,11 @@ def main():
             f.write(full_html)
         print(f"📄 Dry-run complete. Report saved to: {out_file}")
     else:
-        short_topic = args.topic[:55] + ("..." if len(args.topic) > 55 else "")
-        subject = f"🏷️ Price & Link Check: {short_topic} ({date.today().strftime('%b %d')})"
+        if args.title:
+            subject = f"🛒 {args.title}: Lowes Foods Deals ({date.today().strftime('%b %d')})" if "lowes" in args.topic.lower() else f"🛒 {args.title} ({date.today().strftime('%b %d')})"
+        else:
+            short_topic = args.topic[:55] + ("..." if len(args.topic) > 55 else "")
+            subject = f"🏷️ Price & Link Check: {short_topic} ({date.today().strftime('%b %d')})"
         send_email_report(subject, full_html, recipient=args.to)
 
 
