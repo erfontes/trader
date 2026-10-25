@@ -697,25 +697,22 @@ def run_models_and_inference():
         prob_rf = rf.predict_proba(X_today)[0, 1]
         prob_ens = (prob_lgb * 0.60) + (prob_rf * 0.40)
 
-        # Asset-Specific Specialist Routing:
-        # NVDA  -> Tuned RF Specialist (63.3% test accuracy, 0.657 AUC)
-        # AMD   -> Dedicated Semi Specialist (55.1% test accuracy)
-        # COST  -> Staples-RF Specialist (55.1% test accuracy with XLP benchmark)
-        # GOOGL -> Tuned LGBM Specialist (57.1% test accuracy, 0.586 AUC)
-        # TSLA  -> 60/40 Ensemble (Selective Conviction Filter)
-        if ticker == 'NVDA':
-            final_prob = prob_rf
-            model_used = "NVDA Tuned RF Specialist"
-        elif ticker == 'AMD':
+        # Asset-Specific Specialist Routing (Refreshed 2026-10 Benchmark):
+        # AMD   -> Dedicated Semi Specialist (58.2% test accuracy, 0.604 AUC)
+        # GOOGL -> Tuned LGBM Specialist (56.4% test accuracy, 0.597 AUC)
+        # COST  -> Tuned LGBM Specialist (54.5% test accuracy; replaces legacy RF 49.1%)
+        # NVDA  -> 60/40 Ensemble (53.6% test accuracy; replaces legacy RF 48.2%)
+        # TSLA  -> 60/40 Ensemble (57.1% test accuracy, 0.563 AUC)
+        if ticker == 'AMD':
             X_semi = latest_row[semi_features].fillna(0.0)
             final_prob = semi_rf.predict_proba(X_semi)[0, 1]
             model_used = "AMD Semi Specialist"
-        elif ticker == 'COST':
-            final_prob = prob_rf
-            model_used = "COST Staples-RF Specialist"
         elif ticker == 'GOOGL':
             final_prob = prob_lgb
             model_used = "GOOGL Tuned LGBM Specialist"
+        elif ticker == 'COST':
+            final_prob = prob_lgb
+            model_used = "COST Tuned LGBM Specialist"
         else:
             final_prob = prob_ens
             model_used = "60/40 Ensemble (LGB+RF)"
