@@ -25,15 +25,15 @@ cd "$TRADER_DIR"
 
 if [ "$MODE" = "original" ]; then
     echo "🐢 Starting ORIGINAL gemma4_server.py (HF + bitsandbytes MTP)..."
-    nohup "$VEL_PYTHON" "$TRADER_DIR/gemma4_server.py" > /tmp/gemma4_server.log 2>&1 &
+    setsid nohup "$VEL_PYTHON" "$TRADER_DIR/gemma4_server.py" </dev/null > /tmp/gemma4_server.log 2>&1 &
     echo "⏳ Waiting for original server to load weights (~30-45s)..."
 elif [ "$MODE" = "fast" ] || [ "$MODE" = "fast31b" ]; then
     echo "⚡ Starting FAST gemma4_fast_server.py (Gemma 4 31B GGUF Q4_K_M + FlashAttention)..."
-    GEMMA4_FAST_MODEL="gemma4:31b" nohup "$VEL_PYTHON" "$TRADER_DIR/gemma4_fast_server.py" > /tmp/gemma4_fast_server.log 2>&1 &
+    GEMMA4_FAST_MODEL="gemma4:31b" setsid nohup "$VEL_PYTHON" "$TRADER_DIR/gemma4_fast_server.py" </dev/null > /tmp/gemma4_fast_server.log 2>&1 &
     echo "⏳ Waiting for fast 31B server to load weights (~8-15s)..."
 elif [ "$MODE" = "fast26b" ]; then
     echo "🚀 Starting ULTRA-FAST gemma4_fast_server.py (Gemma 4 26B MoE GGUF Q4_K_M)..."
-    GEMMA4_FAST_MODEL="gemma4:26b" nohup "$VEL_PYTHON" "$TRADER_DIR/gemma4_fast_server.py" > /tmp/gemma4_fast_server.log 2>&1 &
+    GEMMA4_FAST_MODEL="gemma4:26b" setsid nohup "$VEL_PYTHON" "$TRADER_DIR/gemma4_fast_server.py" </dev/null > /tmp/gemma4_fast_server.log 2>&1 &
     echo "⏳ Waiting for ultra-fast 26B server to load weights (~6-12s)..."
 else
     echo "Usage: ./switch_gemma_server.sh [status | original | fast | fast26b]"

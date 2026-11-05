@@ -40,11 +40,11 @@ An end-to-end quantitative trading pipeline designed for pre-market execution be
                                              ▼
                               ┌─────────────────────────────┐
                               │  Asset Specialist Router    │
-                              │ • NVDA Tuned RF Specialist  │
-                              │ • AMD Semi Specialist       │
+                              │ • NVDA 60/40 Ensemble Spec. │
                               │ • COST Staples-RF Specialist│
-                              │ • GOOGL Tuned LGBM          │
-                              │ • TSLA 60/40 Ensemble       │
+                              │ • TSLA Tuned RF Specialist  │
+                              │ • AMD Semi-RF Specialist    │
+                              │ • GOOGL AI/Semi-RF Spec.    │
                               └──────────────┬──────────────┘
                                              ▼
                               ┌─────────────────────────────┐
@@ -68,19 +68,20 @@ An end-to-end quantitative trading pipeline designed for pre-market execution be
 The pipeline uses an **Asset Specialist Router** with **Exponential Recency Weighting** rather than treating historical data uniformly:
 1. **1-Year Expanding Baseline**: Maintains ~1,300+ historical bars so models retain structural macro regime awareness (high/low VIX periods, rate prints, multi-month trends).
 2. **Exponential Recency Decay**: Applies sample weights $w_t = \exp\left(-\frac{\ln(2)}{H} \Delta t\right)$ with a configurable half-life (default: `RECENCY_HALF_LIFE_DAYS=60`). Recent 30-day market conditions have **~2.8x higher influence** on tree splits than data from 90 days ago.
-3. **Asset-Specific Specialization**:
-   - **NVDA** $\rightarrow$ Tuned Random Forest Specialist (captures chip momentum & volume surges).
-   - **AMD** $\rightarrow$ Dedicated Semiconductor Specialist (incorporates `SMH` sector signals).
-   - **COST** $\rightarrow$ Staples-RF Specialist (anchored on `XLP` consumer staples benchmark).
-   - **GOOGL** $\rightarrow$ Tuned LightGBM Specialist (non-linear gradient boosting).
-   - **TSLA** $\rightarrow$ 60/40 Regularized Ensemble with selective conviction filtering.
+3. **Asset-Specific Specialization (60.87% Out-of-Sample Accuracy, 0.592 ROC-AUC)**:
+   - **NVDA** $\rightarrow$ `NVDA 60/40 Ensemble Specialist` (**61.8%** accuracy, **0.552** AUC — combines non-linear LightGBM & Random Forest).
+   - **COST** $\rightarrow$ `COST Staples-RF Specialist` (**61.8%** accuracy, **0.594** AUC — anchored on `XLP` consumer staples alpha & isolated from tech-peer spillover).
+   - **TSLA** $\rightarrow$ `TSLA Tuned RF Specialist` (**60.7%** accuracy, **0.556** AUC — depth-regularized Random Forest).
+   - **AMD** $\rightarrow$ `AMD Semi-RF Specialist` (**60.0%** accuracy, **0.640** AUC — incorporates `SMH` semiconductor sector signals & `NVDA` lead).
+   - **GOOGL** $\rightarrow$ `GOOGL AI/Semi-RF Specialist` (**60.0%** accuracy, **0.534** AUC — leverages AI/semiconductor hardware cycle & peer sentiment).
 
 ---
 
 ## 📁 Repository Structure
 
 - `daily_pipeline.py`: Production script automating the complete pre-market process from ingestion to email dispatch.
-- `gemma4_server.py`: High-throughput FastAPI inference server for Gemma 4 31B 4-bit with MTP speculative decoding.
+- `gemma4_fast_server.py`: Ultra-optimized FastAPI inference server for Gemma 4 31B 4-bit (`torch.compile` + Static KV Cache + FlashAttention-2 + MTP speculative decoding).
+- `gemma4_server.py`: Standard FastAPI inference server for Gemma 4 31B 4-bit with MTP speculative decoding.
 - `test_ohlcv_features.py`: Feature engineering benchmark and out-of-sample backtesting script.
 - `gather_train.ipynb`: Jupyter notebook detailing model experiments, hyperparameter tuning, and historical validation.
 - `daily_pipeline.env.example`: Configuration template for SMTP email and model server paths.

@@ -31,6 +31,7 @@ import os
 import sys
 import time
 import signal
+import threading
 import subprocess
 from contextlib import asynccontextmanager
 from typing import List, Optional, Dict, Any
@@ -51,10 +52,71 @@ OLLAMA_BIN = os.getenv("OLLAMA_BIN", "/usr/local/bin/ollama")
 OLLAMA_MODELS_DIR = os.getenv("OLLAMA_MODELS", "/home/erfontes/.ollama/models")
 
 MAX_CONTEXT_TOKENS = int(os.getenv("GEMMA4_MAX_INPUT_TOKENS", "4096"))
-MAX_NEW_TOKENS_CAP = int(os.getenv("GEMMA4_MAX_NEW_TOKENS", "1024"))
+MAX_NEW_TOKENS_CAP = int(os.getenv("GEMMA4_MAX_NEW_TOKENS", "2048"))
 
 ollama_proc: Optional[subprocess.Popen] = None
 server_ready: bool = False
+_ollama_lock = threading.Lock()
+
+
+def start_or_heal_internal_ollama(prewarm: bool = False):
+    """Ensure the internal Ollama runner on 127.0.0.1:11435 is alive and loaded."""
+    global ollama_proc, server_ready
+    with _ollama_lock:
+        if ollama_proc is not None and ollama_proc.poll() is None:
+            return
+        print("⚡ Starting internal C++/CUDA GGUF runner on 127.0.0.1:11435...")
+        env = os.environ.copy()
+        env["OLLAMA_HOST"] = INTERNAL_OLLAMA_HOST
+        env["OLLAMA_MODELS"] = OLLAMA_MODELS_DIR
+        env["OLLAMA_FLASH_ATTENTION"] = "1"
+        env["OLLAMA_KV_CACHE_TYPE"] = "q8_0"
+        env["OLLAMA_MAX_LOADED_MODELS"] = "1"
+        env["OLLAMA_NUM_PARALLEL"] = "1"
+        env["OLLAMA_KEEP_ALIVE"] = "-1"
+
+        log_file = open("/tmp/gemma4_fast_ollama.log", "a")
+        ollama_proc = subprocess.Popen(
+            [OLLAMA_BIN, "serve"],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+        # Wait for internal Ollama daemon to listen
+        for _ in range(30):
+            try:
+                r = requests.get(f"{INTERNAL_OLLAMA_URL}/api/tags", timeout=1)
+                if r.status_code == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+        else:
+            stop_internal_ollama()
+            raise RuntimeError("Internal Ollama engine failed to start on 127.0.0.1:11435")
+
+        if prewarm:
+            print(f"⏳ Loading {DEFAULT_MODEL} (GGUF Q4_K_M) into RTX 4090 VRAM...")
+            t0 = time.time()
+            warm = requests.post(
+                f"{INTERNAL_OLLAMA_URL}/api/generate",
+                json={
+                    "model": DEFAULT_MODEL,
+                    "prompt": "Hi",
+                    "stream": False,
+                    "think": False,
+                    "options": {"num_predict": 1, "num_ctx": MAX_CONTEXT_TOKENS},
+                },
+                timeout=120,
+            )
+            warm.raise_for_status()
+            vram = get_gpu_vram_info()
+            print(f"✅ {DEFAULT_MODEL} loaded in {time.time() - t0:.2f}s!")
+            print(f"📊 GPU Memory in use: {vram['allocated_gb']:.2f} GB / {vram['total_gb']:.2f} GB ({vram['device']})")
+        server_ready = True
 
 
 def get_gpu_vram_info() -> Dict[str, Any]:
@@ -107,7 +169,6 @@ def stop_internal_ollama():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global ollama_proc, server_ready
     print("====================================================================")
     print("⚡ Initializing Gemma 4 FAST GGUF (Q4_K_M + FlashAttention) Server...")
     print(f"Default Model  : {DEFAULT_MODEL} (also supports gemma4:31b & gemma4:26b)")
@@ -115,57 +176,8 @@ async def lifespan(app: FastAPI):
     print(f"Models Path    : {OLLAMA_MODELS_DIR}")
     print("====================================================================")
 
-    env = os.environ.copy()
-    env["OLLAMA_HOST"] = INTERNAL_OLLAMA_HOST
-    env["OLLAMA_MODELS"] = OLLAMA_MODELS_DIR
-    env["OLLAMA_FLASH_ATTENTION"] = "1"
-    env["OLLAMA_KV_CACHE_TYPE"] = "q8_0"
-    env["OLLAMA_MAX_LOADED_MODELS"] = "1"
-    env["OLLAMA_NUM_PARALLEL"] = "1"
-    env["OLLAMA_KEEP_ALIVE"] = "-1"
-
-    log_file = open("/tmp/gemma4_fast_ollama.log", "w")
-    ollama_proc = subprocess.Popen(
-        [OLLAMA_BIN, "serve"],
-        env=env,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        preexec_fn=os.setsid,
-    )
-
-    # Wait for internal Ollama daemon to listen
-    for _ in range(30):
-        try:
-            r = requests.get(f"{INTERNAL_OLLAMA_URL}/api/tags", timeout=1)
-            if r.status_code == 200:
-                break
-        except Exception:
-            pass
-        time.sleep(0.5)
-    else:
-        stop_internal_ollama()
-        raise RuntimeError("Internal Ollama engine failed to start on 127.0.0.1:11435")
-
-    # Pre-warm model into RTX 4090 VRAM
-    print(f"⏳ Loading {DEFAULT_MODEL} (GGUF Q4_K_M) into RTX 4090 VRAM...")
-    t0 = time.time()
     try:
-        warm = requests.post(
-            f"{INTERNAL_OLLAMA_URL}/api/generate",
-            json={
-                "model": DEFAULT_MODEL,
-                "prompt": "Hi",
-                "stream": False,
-                "think": False,
-                "options": {"num_predict": 1, "num_ctx": MAX_CONTEXT_TOKENS},
-            },
-            timeout=120,
-        )
-        warm.raise_for_status()
-        server_ready = True
-        vram = get_gpu_vram_info()
-        print(f"✅ {DEFAULT_MODEL} loaded in {time.time() - t0:.2f}s!")
-        print(f"📊 GPU Memory in use: {vram['allocated_gb']:.2f} GB / {vram['total_gb']:.2f} GB ({vram['device']})")
+        start_or_heal_internal_ollama(prewarm=True)
         print("\n🎉 FAST Server is ready on port 11434 (4x-8x faster drop-in mode)!")
     except Exception as e:
         stop_internal_ollama()
@@ -206,10 +218,16 @@ def resolve_model_name(requested: Optional[str]) -> str:
 # ==============================================================================
 @app.get("/")
 @app.get("/health")
-async def health_check():
+def health_check():
+    if ollama_proc is None or ollama_proc.poll() is not None:
+        try:
+            start_or_heal_internal_ollama(prewarm=True)
+        except Exception:
+            pass
     vram_info = get_gpu_vram_info()
+    is_alive = server_ready and (ollama_proc is not None and ollama_proc.poll() is None)
     return {
-        "status": "online" if server_ready else "loading",
+        "status": "online" if is_alive else "loading",
         "target_model": f"{DEFAULT_MODEL} (GGUF Q4_K_M Fast Engine)",
         "assistant_model": "FlashAttention + Q8_0 KV-Cache (Native CUDA)",
         "speculative_decoding": True,
@@ -223,7 +241,17 @@ async def health_check():
 # ==============================================================================
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Any
+    images: Optional[List[str]] = None
+
+
+def _clean_b64_image(img_str: str) -> str:
+    """Strip data:image/...;base64, prefix if present."""
+    if not img_str:
+        return ""
+    if "," in img_str and img_str.strip().startswith("data:"):
+        return img_str.split(",", 1)[1].strip()
+    return img_str.strip()
 
 
 class ChatCompletionRequest(BaseModel):
@@ -237,7 +265,8 @@ class ChatCompletionRequest(BaseModel):
 
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
+def chat_completions(request: ChatCompletionRequest):
+    start_or_heal_internal_ollama(prewarm=False)
     if not server_ready:
         raise HTTPException(status_code=503, detail="Fast GGUF model not loaded yet.")
 
@@ -245,14 +274,46 @@ async def chat_completions(request: ChatCompletionRequest):
     requested_tokens = min(request.max_tokens or 512, MAX_NEW_TOKENS_CAP)
     temp = request.temperature if request.temperature is not None else 0.7
 
+    ollama_messages = []
+    total_input_chars = 0
+    total_images = 0
+    for m in request.messages:
+        text_content = ""
+        imgs = [_clean_b64_image(x) for x in (m.images or []) if x]
+        if isinstance(m.content, str):
+            text_content = m.content
+        elif isinstance(m.content, list):
+            parts = []
+            for part in m.content:
+                if isinstance(part, dict):
+                    if part.get("type") == "text":
+                        parts.append(part.get("text", ""))
+                    elif part.get("type") == "image_url":
+                        u = (part.get("image_url") or {}).get("url", "")
+                        if u:
+                            imgs.append(_clean_b64_image(u))
+            text_content = "\n".join(parts)
+        total_input_chars += len(text_content)
+        total_images += len(imgs)
+        msg_dict: Dict[str, Any] = {"role": m.role, "content": text_content}
+        if imgs:
+            msg_dict["images"] = imgs
+        ollama_messages.append(msg_dict)
+
+    # Smart dynamic cap: allow up to 2048 output tokens on short/medium prompts,
+    # and scale down on huge inputs so initial input context is never truncated.
+    est_input_tokens = (total_input_chars // 4) + (total_images * 256)
+    safe_remaining = max(768, MAX_CONTEXT_TOKENS - est_input_tokens - 64)
+    effective_max_tokens = min(requested_tokens, safe_remaining)
+
     payload = {
         "model": target_tag,
-        "messages": [{"role": m.role, "content": m.content} for m in request.messages],
+        "messages": ollama_messages,
         "stream": False,
         "think": False,
         "options": {
             "temperature": float(temp),
-            "num_predict": int(requested_tokens),
+            "num_predict": int(effective_max_tokens),
             "num_ctx": MAX_CONTEXT_TOKENS,
         },
     }
@@ -319,7 +380,8 @@ class GenerateRequest(BaseModel):
 
 
 @app.post("/api/generate")
-async def api_generate(request: GenerateRequest):
+def api_generate(request: GenerateRequest):
+    start_or_heal_internal_ollama(prewarm=False)
     if not server_ready:
         raise HTTPException(status_code=503, detail="Fast GGUF model not loaded yet.")
 

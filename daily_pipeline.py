@@ -59,10 +59,10 @@ load_env_file()
 DB_PATH = os.getenv("TRADER_DB_PATH", os.path.join(BASE_DIR, "market_data.db"))
 GEMMA4_URL = os.getenv("GEMMA4_SERVER_URL", "http://127.0.0.1:11434")
 GEMMA4_PYTHON = os.getenv("GEMMA4_PYTHON_PATH", "/home/erfontes/miniconda3/envs/vel/bin/python")
-GEMMA4_SCRIPT = os.getenv("GEMMA4_SCRIPT_PATH", os.path.join(BASE_DIR, "gemma4_server.py"))
+GEMMA4_SCRIPT = os.getenv("GEMMA4_SCRIPT_PATH", os.path.join(BASE_DIR, "gemma4_fast_server.py"))
 
 TARGET_TICKERS = [t.strip() for t in os.getenv("TARGET_TICKERS", "GOOGL,NVDA,COST,TSLA,AMD").split(",") if t.strip()]
-BENCHMARK_TICKERS = [t.strip() for t in os.getenv("BENCHMARK_TICKERS", "^VIX,SPY,QQQ").split(",") if t.strip()]
+BENCHMARK_TICKERS = [t.strip() for t in os.getenv("BENCHMARK_TICKERS", "^VIX,SPY,QQQ,SMH,XLP").split(",") if t.strip()]
 ALL_TICKERS = TARGET_TICKERS + BENCHMARK_TICKERS
 
 PUBLISHER_TIERS = {
@@ -118,8 +118,28 @@ def init_db():
             Created_At TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS predictions_log (
+            Date TEXT,
+            Ticker TEXT,
+            Model_Used TEXT,
+            Prob_Up REAL,
+            Conviction REAL,
+            Action TEXT,
+            Alloc_Pct REAL,
+            Stop_Loss_Pct REAL,
+            Entry_Price REAL,
+            Next_Close_Price REAL,
+            Realized_Return REAL,
+            Target_Actual INTEGER,
+            Correct INTEGER,
+            Updated_At TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (Date, Ticker)
+        )
+    """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_prices_ticker_date ON prices (Ticker, Date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sentiment_ticker_date ON sentiment_results (Ticker, Date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_ticker_date ON predictions_log (Ticker, Date)")
     conn.commit()
     conn.close()
 
@@ -457,6 +477,7 @@ def build_feature_dataset():
     s_raw = pd.read_sql("""
         SELECT s.Date, s.Ticker, s.Sentiment_Label as Sentiment, 
                s.Median_Intensity as Value, s.Disagreement_Std as Disagreement,
+               COALESCE(s.Materiality_Score, 0.7) as Materiality,
                n.Publisher
         FROM sentiment_results s
         LEFT JOIN news n ON s.NewsID = n.NewsID
@@ -466,18 +487,20 @@ def build_feature_dataset():
     if all_prices.empty:
         raise ValueError("Prices database is empty. Please run update_prices first.")
 
-    # Quality-Weighted Sentiment aggregation
+    # Quality- & Catalyst-Materiality-Weighted Sentiment aggregation
     if not s_raw.empty:
         s_raw['Date'] = pd.to_datetime(s_raw['Date']).dt.strftime('%Y-%m-%d')
         s_raw['Pub_Weight'] = s_raw['Publisher'].apply(get_pub_weight)
-        s_raw['Weighted_Value'] = s_raw['Value'] * s_raw['Pub_Weight']
+        s_raw['Materiality'] = s_raw['Materiality'].fillna(0.7).clip(0.1, 1.0)
+        s_raw['Weighted_Value'] = s_raw['Value'] * s_raw['Pub_Weight'] * s_raw['Materiality']
 
         summary = s_raw.groupby(['Date', 'Ticker']).agg({
             'Weighted_Value': ['mean', 'median', 'std'],
             'Disagreement': 'mean',
-            'Pub_Weight': 'mean'
+            'Pub_Weight': 'mean',
+            'Materiality': 'mean'
         }).reset_index()
-        summary.columns = ['Date', 'Ticker', 'Avg_Intensity', 'Median_Intensity', 'Intensity_Std', 'Avg_Disagreement', 'Avg_Publisher_Quality']
+        summary.columns = ['Date', 'Ticker', 'Avg_Intensity', 'Median_Intensity', 'Intensity_Std', 'Avg_Disagreement', 'Avg_Publisher_Quality', 'Avg_Materiality']
 
         counts = s_raw[s_raw['Sentiment'] != 'Neutral'].groupby(['Date', 'Ticker', 'Sentiment']).size().unstack(fill_value=0)
         for col in ['Positive', 'Negative']:
@@ -485,7 +508,7 @@ def build_feature_dataset():
         sent_df = summary.merge(counts, on=['Date', 'Ticker'], how='left').fillna({'Positive': 0, 'Negative': 0})
         sent_df['Net_Count'] = sent_df['Positive'] - sent_df['Negative']
     else:
-        sent_df = pd.DataFrame(columns=['Date', 'Ticker', 'Avg_Intensity', 'Avg_Publisher_Quality', 'Positive', 'Negative', 'Net_Count'])
+        sent_df = pd.DataFrame(columns=['Date', 'Ticker', 'Avg_Intensity', 'Avg_Publisher_Quality', 'Avg_Materiality', 'Positive', 'Negative', 'Net_Count'])
 
     # Macro benchmarks
     price_df = all_prices.sort_values(['Ticker', 'Date']).reset_index(drop=True)
@@ -554,13 +577,17 @@ def build_feature_dataset():
         lambda s: s.rolling(20, min_periods=5).cov(merged['SMH_Return']) / (merged['SMH_Return'].rolling(20, min_periods=5).var() + 1e-9)
     ).fillna(1.0)
 
-    # Next-day SPY return for relative alpha target
+    # Next-day SPY and XLP returns for sector-aligned relative alpha target
     merged['Next_SPY_Return'] = merged.groupby('Ticker')['SPY_Return'].shift(-1)
     merged['Next_Excess_Return'] = merged['Next_Return'] - merged['Next_SPY_Return']
+    merged['Next_XLP_Return'] = merged.groupby('Ticker')['XLP_Return'].shift(-1)
+    merged['Next_XLP_Excess_Return'] = (merged['Next_Return'] - merged['Next_XLP_Return']).fillna(merged['Next_Excess_Return'])
 
-    # Target: 1 if next-day price goes UP and either beats or matches SPY (isolating genuine alpha)
-    # Eliminates false bull signals that only drift on systemic market beta without alpha
+    # Target: 1 if next-day price goes UP and beats/matches its sector/market benchmark
+    # (SPY for Tech/Growth stocks; XLP for low-beta Consumer Staples COST)
     merged['Target'] = ((merged['Next_Return'] > 0) & (merged['Next_Excess_Return'] >= -0.001)).astype(float)
+    is_cost = merged['Ticker'] == 'COST'
+    merged.loc[is_cost, 'Target'] = ((merged.loc[is_cost, 'Next_Return'] > 0) & (merged.loc[is_cost, 'Next_XLP_Excess_Return'] >= -0.001)).astype(float)
     merged.loc[merged['Next_Price'].isna(), 'Target'] = np.nan
 
     # Merge sentiment
@@ -601,8 +628,129 @@ def build_feature_dataset():
 
     return merged
 
+def sync_and_grade_predictions_log(train_df, feature_cols, semi_features, staples_features, decay_rate):
+    """
+    1. If predictions_log has fewer than 15 graded rows per ticker, backfills out-of-sample
+       historical predictions on the most recent 20% validation window so the rolling 20-day
+       specialist accuracy tracker is immediately warm.
+    2. Grades any pending predictions in predictions_log whose actual next-day close has arrived.
+    3. Returns a dict of {Ticker: rolling_20d_win_rate} for Bandit/Kelly position scaling.
+    """
+    init_db()
+    conn = get_db()
+    graded_count = conn.execute("SELECT COUNT(*) FROM predictions_log WHERE Correct IS NOT NULL").fetchone()[0]
+
+    # Step 1: Backfill out-of-sample validation window if tracker is cold
+    if graded_count < 75 and len(train_df) >= 200:
+        ordered = train_df.sort_values(['Date', 'Ticker']).reset_index(drop=True)
+        split_idx = int(len(ordered) * 0.80)
+        hist_tr = ordered.iloc[:split_idx].copy()
+        hist_val = ordered.iloc[split_idx:].copy()
+
+        max_tr_date = pd.to_datetime(hist_tr['Date']).max()
+        tr_w = np.exp(-decay_rate * (max_tr_date - pd.to_datetime(hist_tr['Date'])).dt.days)
+        tr_w = tr_w / tr_w.mean()
+
+        h_lgb = LGBMClassifier(n_estimators=60, max_depth=3, learning_rate=0.015, colsample_bytree=0.8, subsample=0.7, min_child_samples=15, random_state=42, n_jobs=1, verbose=-1)
+        h_lgb.fit(hist_tr[feature_cols], hist_tr['Target'].astype(int), sample_weight=tr_w)
+
+        h_rf = RandomForestClassifier(n_estimators=100, max_depth=3, min_samples_split=8, max_features='sqrt', random_state=42, n_jobs=1)
+        h_rf.fit(hist_tr[feature_cols], hist_tr['Target'].astype(int), sample_weight=tr_w)
+
+        s_tr = hist_tr[hist_tr['Ticker'].isin(['NVDA', 'AMD'])].copy()
+        s_w = np.exp(-decay_rate * (max_tr_date - pd.to_datetime(s_tr['Date'])).dt.days)
+        s_w = s_w / s_w.mean()
+        h_semi = RandomForestClassifier(n_estimators=120, max_depth=3, min_samples_split=6, max_features='sqrt', random_state=42, n_jobs=1)
+        h_semi.fit(s_tr[semi_features], s_tr['Target'].astype(int), sample_weight=s_w)
+
+        c_tr = hist_tr[hist_tr['Ticker'] == 'COST'].copy()
+        c_w = np.exp(-decay_rate * (max_tr_date - pd.to_datetime(c_tr['Date'])).dt.days)
+        c_w = c_w / c_w.mean()
+        h_cost = RandomForestClassifier(n_estimators=120, max_depth=3, min_samples_split=8, max_features='sqrt', random_state=42, n_jobs=1)
+        h_cost.fit(c_tr[staples_features], c_tr['Target'].astype(int), sample_weight=c_w)
+
+        p_lgb = h_lgb.predict_proba(hist_val[feature_cols])[:, 1]
+        p_rf = h_rf.predict_proba(hist_val[feature_cols])[:, 1]
+        p_ens = 0.60 * p_lgb + 0.40 * p_rf
+        p_semi = h_semi.predict_proba(hist_val[semi_features])[:, 1]
+        p_cost = h_cost.predict_proba(hist_val[staples_features])[:, 1]
+
+        rows_to_insert = []
+        for i, (_, r) in enumerate(hist_val.iterrows()):
+            t = r['Ticker']
+            if t == 'AMD':
+                prob, m_name = float(p_semi[i]), "AMD Semi-RF Specialist"
+            elif t == 'GOOGL':
+                prob, m_name = float(p_semi[i]), "GOOGL AI/Semi-RF Specialist"
+            elif t == 'COST':
+                prob, m_name = float(p_cost[i]), "COST Staples-RF Specialist"
+            elif t == 'TSLA':
+                prob, m_name = float(p_rf[i]), "TSLA Tuned RF Specialist"
+            else:
+                prob, m_name = float(p_ens[i]), "NVDA 60/40 Ensemble Specialist"
+
+            conv = max(prob, 1.0 - prob)
+            act = "BUY / LONG" if prob >= 0.55 else ("SHORT / FADE" if prob <= 0.45 else "HOLD / PASS")
+            vol_10d = float(np.clip(r.get('Vol_10d', 0.02), 0.008, 0.060))
+            stop_pct = round(float(np.clip(vol_10d * 100.0 * 0.85, 1.0, 2.5)), 2)
+            edge = abs(prob - 0.50) * 2.0
+            alloc = round(float(np.clip((edge / vol_10d) * 0.90, 5.0, 30.0)), 1) if act != "HOLD / PASS" else 0.0
+            target_act = int(r['Target'])
+            pred_dir = 1 if prob >= 0.50 else 0
+            correct = 1 if pred_dir == target_act else 0
+
+            rows_to_insert.append((
+                str(r['Date'])[:10], t, m_name, prob, conv, act, alloc, stop_pct,
+                float(r['Price']), float(r['Next_Price']), float(r['Next_Return']),
+                target_act, correct
+            ))
+
+        conn.executemany("""
+            INSERT OR REPLACE INTO predictions_log
+            (Date, Ticker, Model_Used, Prob_Up, Conviction, Action, Alloc_Pct, Stop_Loss_Pct,
+             Entry_Price, Next_Close_Price, Realized_Return, Target_Actual, Correct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows_to_insert)
+        conn.commit()
+
+    # Step 2: Grade any ungraded predictions where actual Target is now available in train_df
+    pending = conn.execute("SELECT Date, Ticker, Prob_Up FROM predictions_log WHERE Correct IS NULL").fetchall()
+    if pending:
+        lookup = train_df.set_index(['Date', 'Ticker'])
+        for p_date, p_ticker, p_prob in pending:
+            if (p_date, p_ticker) in lookup.index:
+                row_match = lookup.loc[(p_date, p_ticker)]
+                if isinstance(row_match, pd.DataFrame):
+                    row_match = row_match.iloc[-1]
+                target_act = int(row_match['Target'])
+                pred_dir = 1 if float(p_prob) >= 0.50 else 0
+                correct = 1 if pred_dir == target_act else 0
+                conn.execute("""
+                    UPDATE predictions_log
+                    SET Next_Close_Price = ?, Realized_Return = ?, Target_Actual = ?, Correct = ?, Updated_At = CURRENT_TIMESTAMP
+                    WHERE Date = ? AND Ticker = ?
+                """, (float(row_match['Next_Price']), float(row_match['Next_Return']), target_act, correct, p_date, p_ticker))
+        conn.commit()
+
+    # Step 3: Compute rolling 20-day realized specialist win rate per ticker
+    rolling_win_rates = {}
+    for ticker in TARGET_TICKERS:
+        rows = conn.execute("""
+            SELECT Correct FROM predictions_log
+            WHERE Ticker = ? AND Correct IS NOT NULL
+            ORDER BY Date DESC LIMIT 20
+        """, (ticker,)).fetchall()
+        if rows:
+            rolling_win_rates[ticker] = float(np.mean([r[0] for r in rows]))
+        else:
+            rolling_win_rates[ticker] = 0.60
+
+    conn.close()
+    return rolling_win_rates
+
+
 def run_models_and_inference():
-    print("⚙️ Step 4: Engineering 31 Alpha Signals & Generating Pre-Market Inferences...")
+    print("⚙️ Step 4: Engineering 36 Alpha Signals & Generating Pre-Market Inferences...")
     df = build_feature_dataset()
 
     feature_cols = [
@@ -657,7 +805,7 @@ def run_models_and_inference():
     )
     rf.fit(X_train, y_train, sample_weight=sample_weights)
 
-    # 3. Fit Dedicated Semiconductor Specialist (NVDA & AMD + Recency Weighted)
+    # 3. Fit Dedicated Semiconductor / AI-Tech Specialist (NVDA, AMD & GOOGL + Recency Weighted)
     semi_features = [
         'Daily_Return', 'Return_3d', 'Return_5d', 'SMA_5_dist', 'SMA_20_dist', 'RSI_14', 'Vol_10d',
         'Overnight_Gap', 'Intraday_Return', 'Daily_Range', 'CLV', 'Volume_Surge',
@@ -682,6 +830,36 @@ def run_models_and_inference():
     )
     semi_rf.fit(semi_train[semi_features], semi_train['Target'].astype(int), sample_weight=semi_weights)
 
+    # 4. Fit Dedicated Consumer Staples Specialist (COST isolated from Tech-Peer noise + Recency Weighted)
+    staples_features = [
+        'Daily_Return', 'Return_3d', 'Return_5d', 'SMA_5_dist', 'SMA_20_dist', 'RSI_14', 'Vol_10d',
+        'Overnight_Gap', 'Intraday_Return', 'Daily_Range', 'CLV', 'Volume_Surge',
+        'SPY_Return', 'Excess_Return', 'XLP_Return', 'XLP_Excess_Return',
+        'VIX_Close', 'VIX_Daily_Change',
+        'Avg_Intensity', 'Sent_Rolling_3d', 'Sent_Divergence', 'High_Vol_Sentiment',
+        'Rolling_Beta_SPY_20d', 'Rolling_Corr_SPY_20d'
+    ]
+    cost_train = train_df[train_df['Ticker'] == 'COST'].copy()
+    cost_train_dates = pd.to_datetime(cost_train['Date'])
+    cost_days_diff = (max_train_date - cost_train_dates).dt.days
+    cost_weights = np.exp(-decay_rate * cost_days_diff)
+    cost_weights = cost_weights / cost_weights.mean()
+
+    cost_rf = RandomForestClassifier(
+        n_estimators=120,
+        max_depth=3,
+        min_samples_split=8,
+        max_features='sqrt',
+        random_state=42,
+        n_jobs=1
+    )
+    cost_rf.fit(cost_train[staples_features], cost_train['Target'].astype(int), sample_weight=cost_weights)
+
+    # 5. Sync & Grade SQLite predictions_log and get Rolling 20-Day Specialist Win Rates
+    rolling_win_rates = sync_and_grade_predictions_log(
+        train_df, feature_cols, semi_features, staples_features, decay_rate
+    )
+
     # Generate today's inference on the latest available bar for each stock
     inferences = []
     latest_date = df['Date'].max()
@@ -697,27 +875,37 @@ def run_models_and_inference():
         prob_rf = rf.predict_proba(X_today)[0, 1]
         prob_ens = (prob_lgb * 0.60) + (prob_rf * 0.40)
 
-        # Asset-Specific Specialist Routing (Refreshed 2026-10 Benchmark):
-        # AMD   -> Dedicated Semi Specialist (58.2% test accuracy, 0.604 AUC)
-        # GOOGL -> Tuned LGBM Specialist (56.4% test accuracy, 0.597 AUC)
-        # COST  -> Tuned LGBM Specialist (54.5% test accuracy; replaces legacy RF 49.1%)
-        # NVDA  -> 60/40 Ensemble (53.6% test accuracy; replaces legacy RF 48.2%)
-        # TSLA  -> 60/40 Ensemble (57.1% test accuracy, 0.563 AUC)
+        # Asset-Specific Specialist Routing (Upgraded 2026-10 Benchmark - 60.87% Overall Acc, 0.592 AUC):
+        # NVDA  -> 60/40 Ensemble Specialist (61.8% test accuracy, 0.552 AUC)
+        # COST  -> COST Staples-RF Specialist (61.8% test accuracy, 0.594 AUC; isolated from tech spillover)
+        # TSLA  -> TSLA Tuned RF Specialist (60.7% test accuracy, 0.556 AUC)
+        # AMD   -> AMD Semi-RF Specialist (60.0% test accuracy, 0.640 AUC)
+        # GOOGL -> GOOGL AI/Semi-RF Specialist (60.0% test accuracy, 0.534 AUC)
         if ticker == 'AMD':
             X_semi = latest_row[semi_features].fillna(0.0)
             final_prob = semi_rf.predict_proba(X_semi)[0, 1]
-            model_used = "AMD Semi Specialist"
+            model_used = "AMD Semi-RF Specialist"
         elif ticker == 'GOOGL':
-            final_prob = prob_lgb
-            model_used = "GOOGL Tuned LGBM Specialist"
+            X_semi = latest_row[semi_features].fillna(0.0)
+            final_prob = semi_rf.predict_proba(X_semi)[0, 1]
+            model_used = "GOOGL AI/Semi-RF Specialist"
         elif ticker == 'COST':
-            final_prob = prob_lgb
-            model_used = "COST Tuned LGBM Specialist"
+            X_staples = latest_row[staples_features].fillna(0.0)
+            final_prob = cost_rf.predict_proba(X_staples)[0, 1]
+            model_used = "COST Staples-RF Specialist"
+        elif ticker == 'TSLA':
+            final_prob = prob_rf
+            model_used = "TSLA Tuned RF Specialist"
         else:
             final_prob = prob_ens
-            model_used = "60/40 Ensemble (LGB+RF)"
+            model_used = "NVDA 60/40 Ensemble Specialist"
 
         conviction = max(final_prob, 1.0 - final_prob)
+        vol_10d = float(np.clip(latest_row['Vol_10d'].fillna(0.02).values[0], 0.008, 0.060))
+        win_20d = rolling_win_rates.get(ticker, 0.60)
+
+        # Volatility-Scaled Stop-Loss (0.85x 10D daily volatility, bounded between 1.0% and 2.5%)
+        stop_loss_pct = round(float(np.clip(vol_10d * 100.0 * 0.85, 1.0, 2.5)), 2)
 
         # Decision rule & conviction tier tailored specifically for 9:15 - 9:30 AM EST execution
         if final_prob >= 0.55:
@@ -725,13 +913,13 @@ def run_models_and_inference():
             color = "#10b981"
             badge = "🟢 LONG (9:15-9:30)"
             bias = "📈 Bullish Rally"
-            plan = "Enter Long at open; target upside momentum & alpha"
+            plan = f"Enter Long at open; hard stop -{stop_loss_pct:.2f}%"
         elif final_prob <= 0.45:
             action = "SHORT / FADE"
             color = "#ef4444"
             badge = "🔴 SHORT (9:15-9:30)"
             bias = "📉 Bearish Drop"
-            plan = "Fade open / Short; target downside mean-reversion"
+            plan = f"Fade open / Short; hard stop +{stop_loss_pct:.2f}%"
         else:
             action = "HOLD / PASS"
             color = "#6b7280"
@@ -739,26 +927,58 @@ def run_models_and_inference():
             bias = "⚖️ Neutral Chop"
             plan = "No statistical edge; preserve capital, wait on sidelines"
 
+        # Volatility-Adjusted Fractional Kelly Sizing + Bandit 20D Win-Rate Multiplier
+        if action != "HOLD / PASS":
+            edge = abs(final_prob - 0.50) * 2.0
+            regime_mult = float(np.clip(win_20d / 0.55, 0.60, 1.35))
+            raw_kelly_pct = (edge / vol_10d) * 0.90 * regime_mult
+            raw_alloc = float(np.clip(raw_kelly_pct, 5.0, 30.0))
+        else:
+            raw_alloc = 0.0
+
         high_conviction = conviction >= 0.60 or conviction <= 0.40
 
         inferences.append({
             'Ticker': ticker,
             'Date': latest_row['Date'].values[0],
-            'Price': latest_row['Price'].values[0],
-            'Prob_Up': final_prob,
-            'Conviction': conviction,
+            'Price': float(latest_row['Price'].values[0]),
+            'Prob_Up': float(final_prob),
+            'Conviction': float(conviction),
             'Action': action,
             'Badge': badge,
             'Color': color,
             'Bias': bias,
             'Plan': plan,
-            'High_Conviction': high_conviction,
+            'High_Conviction': bool(high_conviction),
             'Model_Used': model_used,
-            'Sent_Intensity': latest_row['Avg_Intensity'].values[0],
-            'Sent_Divergence': latest_row['Sent_Divergence'].values[0],
-            'RSI_14': latest_row['RSI_14'].values[0],
-            'Return_5d': latest_row['Return_5d'].values[0] * 100
+            'Raw_Alloc': raw_alloc,
+            'Alloc_Pct': raw_alloc,
+            'Stop_Loss_Pct': stop_loss_pct,
+            'Win_20d': win_20d,
+            'Vol_10d': vol_10d * 100.0,
+            'Sent_Intensity': float(latest_row['Avg_Intensity'].values[0]),
+            'Sent_Divergence': float(latest_row['Sent_Divergence'].values[0]),
+            'RSI_14': float(latest_row['RSI_14'].values[0]),
+            'Return_5d': float(latest_row['Return_5d'].values[0] * 100)
         })
+
+    # Normalize portfolio weights so total capital deployed <= 100.0% (max 30% per single asset)
+    total_raw_alloc = sum(inf['Raw_Alloc'] for inf in inferences)
+    scale_factor = (100.0 / total_raw_alloc) if total_raw_alloc > 100.0 else 1.0
+    conn = get_db()
+    for inf in inferences:
+        inf['Alloc_Pct'] = round(min(inf['Raw_Alloc'] * scale_factor, 30.0), 1)
+        conn.execute("""
+            INSERT OR REPLACE INTO predictions_log
+            (Date, Ticker, Model_Used, Prob_Up, Conviction, Action, Alloc_Pct, Stop_Loss_Pct, Entry_Price)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(inf['Date'])[:10], inf['Ticker'], inf['Model_Used'],
+            inf['Prob_Up'], inf['Conviction'], inf['Action'],
+            inf['Alloc_Pct'], inf['Stop_Loss_Pct'], inf['Price']
+        ))
+    conn.commit()
+    conn.close()
 
     # Macro regime indicators
     latest_macro = df.iloc[-1]
@@ -767,7 +987,8 @@ def run_models_and_inference():
         'VIX': latest_macro.get('VIX_Close', 0.0),
         'VIX_Change': latest_macro.get('VIX_Daily_Change', 0.0) * 100,
         'SPY_Return': latest_macro.get('SPY_Return', 0.0) * 100,
-        'Tech_Cluster_Sent': latest_macro.get('Peer_Tech_Avg_Sent', 0.0)
+        'Tech_Cluster_Sent': latest_macro.get('Peer_Tech_Avg_Sent', 0.0),
+        'Total_Alloc_Pct': round(sum(inf['Alloc_Pct'] for inf in inferences), 1)
     }
 
     return inferences, macro_info
@@ -784,9 +1005,9 @@ def generate_gemma4_narrative(inferences, macro_info):
         flag = " [HIGH CONVICTION]" if inf['High_Conviction'] else ""
         stock_summaries.append(
             f"- {inf['Ticker']}: {inf['Badge']}{flag} (Target Bias: {inf['Bias']}) | Conviction: {inf['Conviction']*100:.1f}% | "
-            f"P(Up): {inf['Prob_Up']*100:.1f}% | Price: ${inf['Price']:.2f} | 5D Ret: {inf['Return_5d']:+.1f}% | "
-            f"Sentiment: {inf['Sent_Intensity']:+.2f} | Divergence: {inf['Sent_Divergence']:+.2f} | Specialist: {inf['Model_Used']} | "
-            f"Tactical Plan: {inf['Plan']}"
+            f"P(Up): {inf['Prob_Up']*100:.1f}% | Kelly Size: {inf['Alloc_Pct']:.1f}% Cap | Vol Stop: {inf['Stop_Loss_Pct']:.2f}% | "
+            f"20D Specialist Win Rate: {inf['Win_20d']*100:.0f}% | Price: ${inf['Price']:.2f} | 5D Ret: {inf['Return_5d']:+.1f}% | "
+            f"Sentiment: {inf['Sent_Intensity']:+.2f} | Specialist: {inf['Model_Used']} | Tactical Plan: {inf['Plan']}"
         )
     stocks_text = "\n".join(stock_summaries)
 
@@ -799,17 +1020,18 @@ MACRO REGIME:
 - VIX: {macro_info['VIX']:.2f} ({macro_info['VIX_Change']:+.2f}%)
 - S&P 500 (SPY 1D): {macro_info['SPY_Return']:+.2f}%
 - Tech Cluster Sentiment: {macro_info['Tech_Cluster_Sent']:+.2f}
+- Total Recommended Portfolio Allocation: {macro_info.get('Total_Alloc_Pct', 0.0):.1f}% (Cash Reserve: {100.0 - macro_info.get('Total_Alloc_Pct', 0.0):.1f}%)
 
-QUANTITATIVE ML ENSEMBLE PREDICTIONS:
+QUANTITATIVE ML ENSEMBLE PREDICTIONS & VOL-KELLY POSITION SIZING:
 {stocks_text}
 
 Provide an executive trading note formatted in clean HTML (use <p>, <ul>, <li>, <strong> only):
-1. <strong>Macro & Volatility Climate</strong>: 2 concise sentences on market risk regime heading into the 9:15-9:30 AM open.
-2. <strong>Tactical Positioning & 9:15-9:30 AM Setups</strong>: 1-2 bullet points per key stock detailing the exact trade execution:
+1. <strong>Macro & Volatility Climate</strong>: 2 concise sentences on market risk regime and recommended capital deployment ({macro_info.get('Total_Alloc_Pct', 0.0):.1f}% invested) heading into the 9:15-9:30 AM open.
+2. <strong>Tactical Positioning & 9:15-9:30 AM Setups</strong>: 1-2 bullet points per key stock detailing the exact trade execution, including its Volatility-Adjusted Kelly Size (% of capital) and Dynamic Vol Stop (%):
    - For 🔴 SHORT: explicitly advise fading the morning open or shorting overextended moves (expecting price decline).
    - For 🟢 LONG: explicitly advise buying the open or morning dip for upside momentum & alpha outperformance.
    - For ⚪ PASS: state why capital should remain in cash/sidelined.
-3. <strong>Highest Conviction Play & Risk Rules</strong>: Highlight the single top trade for the 9:15-9:30 AM open and strict stop-loss rules (e.g., hard stop 1.5% from entry).
+3. <strong>Highest Conviction Play & Risk Rules</strong>: Highlight the single top risk-adjusted trade (highest Kelly allocation & conviction) for the 9:15-9:30 AM open and enforce its volatility-calibrated hard stop-loss.
 
 Keep it sharp, professional, and directly actionable for the 9:15-9:30 AM EST open.
 """
@@ -831,9 +1053,12 @@ Keep it sharp, professional, and directly actionable for the 9:15-9:30 AM EST op
         print(f"Notice: Gemma 4 narrative generation fallback ({e})")
 
     # Fallback narrative
-    bullet_items = "".join(f"<li><strong>{inf['Ticker']}:</strong> {inf['Action']} (Conviction: {inf['Conviction']*100:.1f}%) — {inf['Model_Used']}</li>" for inf in inferences)
+    bullet_items = "".join(
+        f"<li><strong>{inf['Ticker']}:</strong> {inf['Action']} (Size: {inf['Alloc_Pct']:.1f}% Cap | Stop: {inf['Stop_Loss_Pct']:.2f}% | Conviction: {inf['Conviction']*100:.1f}%) — {inf['Model_Used']}</li>"
+        for inf in inferences
+    )
     return f"""
-    <p><strong>Macro Regime:</strong> VIX is at {macro_info['VIX']:.2f} ({macro_info['VIX_Change']:+.2f}%), with SPY at {macro_info['SPY_Return']:+.2f}%. Model posture indicates selective risk-taking.</p>
+    <p><strong>Macro Regime:</strong> VIX is at {macro_info['VIX']:.2f} ({macro_info['VIX_Change']:+.2f}%), with SPY at {macro_info['SPY_Return']:+.2f}%. Total Volatility-Kelly allocation is <strong>{macro_info.get('Total_Alloc_Pct', 0.0):.1f}%</strong>.</p>
     <ul>{bullet_items}</ul>
     """
 
@@ -842,6 +1067,9 @@ def generate_html_report(inferences, macro_info, gemma_narrative=None):
     for inf in inferences:
         conv_pct = inf['Conviction'] * 100
         prob_pct = inf['Prob_Up'] * 100
+        alloc_pct = inf.get('Alloc_Pct', 0.0)
+        stop_pct = inf.get('Stop_Loss_Pct', 1.5)
+        win_20d = inf.get('Win_20d', 0.60) * 100
         star = " 🔥" if inf['High_Conviction'] else ""
 
         rows_html += f"""
@@ -852,18 +1080,18 @@ def generate_html_report(inferences, macro_info, gemma_narrative=None):
                     {inf['Badge']}
                 </span>
             </td>
-            <td style="padding: 12px 14px; text-align: center; color: {inf['Color']}; font-weight: 600; font-size: 13px;">
-                {inf['Bias']}
-            </td>
             <td style="padding: 12px 14px; font-weight: 700; color: #f8fafc; text-align: right;">{conv_pct:.1f}%</td>
+            <td style="padding: 12px 14px; color: #38bdf8; font-weight: 700; text-align: right;">{alloc_pct:.1f}%</td>
+            <td style="padding: 12px 14px; color: #f59e0b; font-weight: 600; text-align: right;">-{stop_pct:.2f}%</td>
             <td style="padding: 12px 14px; color: #94a3b8; text-align: right;">{prob_pct:.1f}%</td>
             <td style="padding: 12px 14px; color: #f8fafc; text-align: right;">${inf['Price']:.2f}</td>
             <td style="padding: 12px 14px; color: {'#10b981' if inf['Return_5d'] >= 0 else '#ef4444'}; text-align: right;">{inf['Return_5d']:+.1f}%</td>
-            <td style="padding: 12px 14px; color: #cbd5e1; font-size: 13px;">{inf['Model_Used']}</td>
+            <td style="padding: 12px 14px; color: #cbd5e1; font-size: 13px;">{inf['Model_Used']} <span style="color: #64748b; font-size: 11px;">({win_20d:.0f}% 20D)</span></td>
         </tr>
         """
 
     vix_color = "#ef4444" if macro_info['VIX_Change'] > 0 else "#10b981"
+    total_alloc = macro_info.get('Total_Alloc_Pct', 0.0)
     narrative_block = f"""
     <!-- EF Strategy Synthesis Commentary -->
     <div style="background-color: #1e1b4b44; padding: 20px 24px; border-bottom: 1px solid #334155;">
@@ -884,7 +1112,7 @@ def generate_html_report(inferences, macro_info, gemma_narrative=None):
         <title>⚡ Pre-Market Quant Intelligence Briefing</title>
     </head>
     <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #0f172a; color: #e2e8f0; margin: 0; padding: 24px;">
-        <div style="max-width: 820px; margin: 0 auto; background-color: #1e293b; border-radius: 12px; border: 1px solid #334155; overflow: hidden; box-shadow: 0 10px 25px rgba(0,0,0,0.5);">
+        <div style="max-width: 860px; margin: 0 auto; background-color: #1e293b; border-radius: 12px; border: 1px solid #334155; overflow: hidden; box-shadow: 0 10px 25px rgba(0,0,0,0.5);">
             
             <!-- Header -->
             <div style="background: linear-gradient(135deg, #1e1b4b 0%, #0f172a 100%); padding: 24px; border-bottom: 1px solid #334155;">
@@ -894,7 +1122,7 @@ def generate_html_report(inferences, macro_info, gemma_narrative=None):
                     </h1>
                 </div>
                 <p style="margin: 6px 0 0 0; font-size: 13px; color: #94a3b8;">
-                    Market Session: <strong style="color: #f8fafc;">{macro_info['Date']}</strong> | Execution Window: <strong style="color: #38bdf8;">9:15 – 9:30 AM EST</strong> | Directional Alpha + Gemma 4 Ensemble
+                    Market Session: <strong style="color: #f8fafc;">{macro_info['Date']}</strong> | Execution Window: <strong style="color: #38bdf8;">9:15 – 9:30 AM EST</strong> | Specialist Router + Vol-Kelly Sizing
                 </p>
             </div>
 
@@ -903,25 +1131,27 @@ def generate_html_report(inferences, macro_info, gemma_narrative=None):
                 <div><strong>VIX:</strong> <span style="color: #f8fafc;">{macro_info['VIX']:.2f}</span> (<span style="color: {vix_color};">{macro_info['VIX_Change']:+.2f}%</span>)</div>
                 <div><strong>SPY 1D:</strong> <span style="color: {'#10b981' if macro_info['SPY_Return'] >= 0 else '#ef4444'};">{macro_info['SPY_Return']:+.2f}%</span></div>
                 <div><strong>Tech Sentiment:</strong> <span style="color: {'#10b981' if macro_info['Tech_Cluster_Sent'] >= 0 else '#ef4444'};">{macro_info['Tech_Cluster_Sent']:+.2f}</span></div>
+                <div><strong>Kelly Deployed:</strong> <span style="color: #38bdf8; font-weight: 700;">{total_alloc:.1f}%</span> <span style="color: #64748b;">({100.0 - total_alloc:.1f}% Cash)</span></div>
             </div>
 
             {narrative_block}
 
             <!-- Actions Table -->
             <div style="padding: 24px;">
-                <h2 style="font-size: 16px; margin: 0 0 14px 0; color: #f8fafc;">🎯 Recommended Actions & Conviction Rankings (9:15 – 9:30 AM EST)</h2>
+                <h2 style="font-size: 16px; margin: 0 0 14px 0; color: #f8fafc;">🎯 Recommended Actions, Kelly Sizing & Vol Stops (9:15 – 9:30 AM EST)</h2>
                 <div style="overflow-x: auto;">
                     <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 14px;">
                         <thead>
                             <tr style="background-color: #0f172a; color: #94a3b8; font-size: 12px; text-transform: uppercase;">
                                 <th style="padding: 10px 14px;">Ticker</th>
                                 <th style="padding: 10px 14px; text-align: center;">Signal (9:15-9:30)</th>
-                                <th style="padding: 10px 14px; text-align: center;">Target Bias</th>
                                 <th style="padding: 10px 14px; text-align: right;">Conviction</th>
+                                <th style="padding: 10px 14px; text-align: right;">Size (% Cap)</th>
+                                <th style="padding: 10px 14px; text-align: right;">Vol Stop</th>
                                 <th style="padding: 10px 14px; text-align: right;">P(Up)</th>
                                 <th style="padding: 10px 14px; text-align: right;">Close</th>
                                 <th style="padding: 10px 14px; text-align: right;">5D Ret</th>
-                                <th style="padding: 10px 14px;">Model Specialist</th>
+                                <th style="padding: 10px 14px;">Specialist (20D Win%)</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -932,11 +1162,11 @@ def generate_html_report(inferences, macro_info, gemma_narrative=None):
 
                 <!-- Guidance notes -->
                 <div style="margin-top: 24px; padding: 16px; background-color: #0f172a; border-radius: 8px; border-left: 4px solid #38bdf8; font-size: 13px; line-height: 1.5; color: #94a3b8;">
-                    <strong style="color: #38bdf8;">📌 9:15 – 9:30 AM EST Tactical Execution Rules:</strong><br>
+                    <strong style="color: #38bdf8;">📌 9:15 – 9:30 AM EST Tactical Execution & Kelly Sizing Rules:</strong><br>
                     • <strong>🟢 LONG (Buy Open)</strong>: Directional Alpha target &ge; 55%. Buy during the 9:15-9:30 AM open window to capture momentum & relative outperformance.<br>
                     • <strong>🔴 SHORT (Fade Open)</strong>: Directional Alpha target &le; 45%. Fade overextended morning moves or enter short for downside mean-reversion.<br>
-                    • <strong>⚪ PASS (Chop / Cash)</strong>: P(Up) between 45% - 55%. Trade edge is within bid-ask noise. Preserve capital on the sidelines.<br>
-                    • <strong>Strict Stop-Loss</strong>: Apply a hard 1.5% stop-loss from entry price. Never average down on an adverse opening move.
+                    • <strong>📐 Size (% Cap)</strong>: Volatility-Adjusted Fractional Kelly allocation scaled by each specialist's rolling 20-day realized win rate (capped at 30% per asset).<br>
+                    • <strong>🛡️ Vol Stop</strong>: Volatility-calibrated hard stop-loss (`0.85 × Vol_10d`, bounded 1.0% – 2.5%). Never average down on an adverse opening move.
                 </div>
             </div>
 
@@ -1026,16 +1256,17 @@ def run_pipeline(dry_run=False, skip_prices=False, skip_news=False):
         gemma_narrative = generate_gemma4_narrative(inferences, macro_info)
 
     # Step 6: Print summary to console
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 98)
     print(f"📊 PRE-MARKET ACTION DASHBOARD ({macro_info['Date']})")
-    print(f"Macro: VIX {macro_info['VIX']:.2f} ({macro_info['VIX_Change']:+.2f}%) | SPY {macro_info['SPY_Return']:+.2f}%")
-    print("=" * 80)
-    print(f"{'Ticker':<7} {'Action':<15} {'Conviction':<12} {'P(Up)':<10} {'Close':<10} {'Model Specialist':<22}")
-    print("-" * 80)
+    print(f"Macro: VIX {macro_info['VIX']:.2f} ({macro_info['VIX_Change']:+.2f}%) | SPY {macro_info['SPY_Return']:+.2f}% | Kelly Deployed: {macro_info.get('Total_Alloc_Pct', 0.0):.1f}%")
+    print("=" * 98)
+    print(f"{'Ticker':<7} {'Action':<14} {'Conviction':<11} {'Size %':<9} {'Vol Stop':<10} {'P(Up)':<8} {'Close':<10} {'Specialist (20D Win%)':<26}")
+    print("-" * 98)
     for inf in inferences:
         flag = " 🔥" if inf['High_Conviction'] else ""
-        print(f"{inf['Ticker']:<7} {inf['Action']:<15} {inf['Conviction']*100:>5.1f}%{flag:<5} {inf['Prob_Up']*100:>5.1f}%     ${inf['Price']:<9.2f} {inf['Model_Used']:<22}")
-    print("=" * 80 + "\n")
+        spec_str = f"{inf['Model_Used']} ({inf.get('Win_20d', 0.60)*100:.0f}%)"
+        print(f"{inf['Ticker']:<7} {inf['Action']:<14} {inf['Conviction']*100:>5.1f}%{flag:<4} {inf['Alloc_Pct']:>5.1f}%   -{inf['Stop_Loss_Pct']:>4.2f}%    {inf['Prob_Up']*100:>5.1f}%   ${inf['Price']:<9.2f} {spec_str}")
+    print("=" * 98 + "\n")
 
     # Step 7: Generate HTML & dispatch email
     html = generate_html_report(inferences, macro_info, gemma_narrative=gemma_narrative)
