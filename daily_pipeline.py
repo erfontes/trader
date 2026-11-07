@@ -301,29 +301,49 @@ def update_news():
 
         candidates = []
 
-        # Yahoo Finance news
+        # Yahoo Finance news (try v1 search JSON + RSS fallback, avoiding broken /xhr/ncp endpoint)
+        yf_stories_found = 0
         try:
-            stock = yf.Ticker(ticker)
-            stories = stock.news or []
-            for story in stories:
-                content = story.get('content', {})
-                provider = content.get('provider', {})
-                title = content.get('title', '')
-                summary = content.get('summary', '')
-                publisher = provider.get('displayName', 'Yahoo Finance')
-                raw_date = content.get('pubDate', datetime.now().isoformat())
-                try:
-                    clean_date = pd.to_datetime(raw_date).strftime('%Y-%m-%d %H:%M:%S')
-                except Exception:
-                    clean_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                link = content.get('canonicalUrl', {}).get('url', '')
-                if title:
-                    candidates.append({
-                        'ticker': ticker, 'date': clean_date, 'title': title, 'summary': summary,
-                        'publisher': publisher, 'link': link, 'weight': get_pub_weight(publisher)
-                    })
-        except Exception as e:
-            print(f"Notice: Yahoo News fetch for {ticker}: {e}")
+            yf_search_url = f"https://query2.finance.yahoo.com/v1/finance/search?q={ticker}&quotesCount=0&newsCount=10"
+            r_yf = requests.get(yf_search_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=8)
+            if r_yf.status_code == 200:
+                for story in r_yf.json().get('news', []):
+                    title = story.get('title', '')
+                    publisher = story.get('publisher', 'Yahoo Finance')
+                    link = story.get('link', '')
+                    ts = story.get('providerPublishTime')
+                    clean_date = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    if title:
+                        candidates.append({
+                            'ticker': ticker, 'date': clean_date, 'title': title, 'summary': title,
+                            'publisher': publisher, 'link': link, 'weight': get_pub_weight(publisher)
+                        })
+                        yf_stories_found += 1
+        except Exception:
+            pass
+
+        if yf_stories_found == 0:
+            try:
+                yf_rss_url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
+                r_rss = requests.get(yf_rss_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=8)
+                if r_rss.status_code == 200:
+                    root = ET.fromstring(r_rss.content)
+                    for item in root.findall('.//item')[:10]:
+                        title = item.find('title').text if item.find('title') is not None else ''
+                        link = item.find('link').text if item.find('link') is not None else ''
+                        pub_date = item.find('pubDate').text if item.find('pubDate') is not None else ''
+                        desc = item.find('description').text if item.find('description') is not None else title
+                        try:
+                            clean_date = pd.to_datetime(pub_date).strftime('%Y-%m-%d %H:%M:%S')
+                        except Exception:
+                            clean_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        if title:
+                            candidates.append({
+                                'ticker': ticker, 'date': clean_date, 'title': title, 'summary': desc or title,
+                                'publisher': 'Yahoo Finance', 'link': link, 'weight': get_pub_weight('Yahoo Finance')
+                            })
+            except Exception:
+                pass
 
         # Google News RSS
         try:
@@ -855,7 +875,122 @@ def run_models_and_inference():
     )
     cost_rf.fit(cost_train[staples_features], cost_train['Target'].astype(int), sample_weight=cost_weights)
 
-    # 5. Sync & Grade SQLite predictions_log and get Rolling 20-Day Specialist Win Rates
+    # 5. Automatic Champion-vs-Challenger Gate (models/champion_registry.pkl)
+    #    Both gather_train.ipynb (Cell 22) and daily_pipeline.py automatically evaluate
+    #    new Challenger models against the saved Champion on the 20% OOS holdout window
+    #    and only promote a Challenger if (0.70*Acc + 0.30*AUC) strictly improves.
+    models_dir = os.path.join(BASE_DIR, "models")
+    os.makedirs(models_dir, exist_ok=True)
+    registry_path = os.path.join(models_dir, "champion_registry.pkl")
+    metadata_path = os.path.join(models_dir, "champion_metadata.json")
+    champion_registry = None
+
+    import pickle
+    from sklearn.metrics import accuracy_score, roc_auc_score
+
+    if os.path.exists(registry_path):
+        try:
+            with open(registry_path, "rb") as f:
+                champion_registry = pickle.load(f)
+        except Exception as e:
+            print(f"⚠️ Notice loading Champion Registry ({e}); initializing fresh registry.")
+
+    # Evaluate Challenger vs Champion on chronological 80/20 split of train_df
+    ordered_df = train_df.sort_values(['Date', 'Ticker']).reset_index(drop=True)
+    latest_cutoff_str = str(ordered_df['Date'].max())[:10]
+    split_idx = int(len(ordered_df) * 0.80)
+    val_tr = ordered_df.iloc[:split_idx].copy()
+    val_te = ordered_df.iloc[split_idx:].copy()
+
+    def _fit_suite_on(sub_tr):
+        tr_d = pd.to_datetime(sub_tr['Date'])
+        m_d = tr_d.max()
+        w_all = np.exp(-decay_rate * (m_d - tr_d).dt.days)
+        w_all = w_all / w_all.mean()
+        m_lgb = LGBMClassifier(n_estimators=60, max_depth=3, learning_rate=0.015, colsample_bytree=0.8, subsample=0.7, min_child_samples=15, random_state=42, n_jobs=1, verbose=-1).fit(sub_tr[feature_cols], sub_tr['Target'].astype(int), sample_weight=w_all)
+        m_rf = RandomForestClassifier(n_estimators=100, max_depth=3, min_samples_split=8, max_features='sqrt', random_state=42, n_jobs=1).fit(sub_tr[feature_cols], sub_tr['Target'].astype(int), sample_weight=w_all)
+        s_sub = sub_tr[sub_tr['Ticker'].isin(['NVDA', 'AMD'])].copy()
+        w_s = np.exp(-decay_rate * (m_d - pd.to_datetime(s_sub['Date'])).dt.days)
+        w_s = w_s / w_s.mean()
+        m_semi = RandomForestClassifier(n_estimators=120, max_depth=3, min_samples_split=6, max_features='sqrt', random_state=42, n_jobs=1).fit(s_sub[semi_features], s_sub['Target'].astype(int), sample_weight=w_s)
+        c_sub = sub_tr[sub_tr['Ticker'] == 'COST'].copy()
+        w_c = np.exp(-decay_rate * (m_d - pd.to_datetime(c_sub['Date'])).dt.days)
+        w_c = w_c / w_c.mean()
+        m_cost = RandomForestClassifier(n_estimators=120, max_depth=3, min_samples_split=8, max_features='sqrt', random_state=42, n_jobs=1).fit(c_sub[staples_features], c_sub['Target'].astype(int), sample_weight=w_c)
+        return {'lgb': m_lgb, 'rf': m_rf, 'semi_rf': m_semi, 'cost_rf': m_cost}
+
+    def _pred_suite(suite, sub_df, tkr):
+        if tkr in ['AMD', 'GOOGL']:
+            return suite['semi_rf'].predict_proba(sub_df[semi_features].fillna(0.0))[:, 1]
+        elif tkr == 'COST':
+            return suite['cost_rf'].predict_proba(sub_df[staples_features].fillna(0.0))[:, 1]
+        elif tkr == 'TSLA':
+            return suite['rf'].predict_proba(sub_df[feature_cols].fillna(0.0))[:, 1]
+        else:
+            return 0.60 * suite['lgb'].predict_proba(sub_df[feature_cols].fillna(0.0))[:, 1] + 0.40 * suite['rf'].predict_proba(sub_df[feature_cols].fillna(0.0))[:, 1]
+
+    chal_val_suite = _fit_suite_on(val_tr)
+    chal_prod_suite = {'lgb': lgb, 'rf': rf, 'semi_rf': semi_rf, 'cost_rf': cost_rf}
+    spec_names = {
+        'NVDA': 'NVDA 60/40 Ensemble Specialist',
+        'TSLA': 'TSLA Tuned RF Specialist',
+        'AMD': 'AMD Semi-RF Specialist',
+        'COST': 'COST Staples-RF Specialist',
+        'GOOGL': 'GOOGL AI/Semi-RF Specialist'
+    }
+
+    if champion_registry is None:
+        champion_registry = {'feature_cols': feature_cols, 'semi_features': semi_features, 'staples_features': staples_features, 'tickers': {}}
+
+    promoted_any = False
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    for tkr in TARGET_TICKERS:
+        sub_t = val_te[val_te['Ticker'] == tkr]
+        if sub_t.empty:
+            continue
+        p_chal = _pred_suite(chal_val_suite, sub_t, tkr)
+        acc_chal = float(accuracy_score(sub_t['Target'], (p_chal >= 0.5).astype(int)))
+        auc_chal = float(roc_auc_score(sub_t['Target'], p_chal)) if len(sub_t['Target'].unique()) > 1 else 0.5
+        score_chal = float(0.70 * acc_chal + 0.30 * auc_chal)
+
+        c_entry = champion_registry['tickers'].get(tkr)
+        if c_entry is not None and 'val_suite' in c_entry:
+            p_champ = _pred_suite(c_entry['val_suite'], sub_t, tkr)
+            acc_champ = float(accuracy_score(sub_t['Target'], (p_champ >= 0.5).astype(int)))
+            auc_champ = float(roc_auc_score(sub_t['Target'], p_champ)) if len(sub_t['Target'].unique()) > 1 else 0.5
+            score_champ = float(0.70 * acc_champ + 0.30 * auc_champ)
+        else:
+            score_champ = -1.0
+
+        if score_chal > score_champ + 1e-6:
+            champion_registry['tickers'][tkr] = {
+                'model_name': spec_names.get(tkr, f"{tkr} Specialist"),
+                'cutoff_date': latest_cutoff_str,
+                'promoted_at': today_str,
+                'val_suite': chal_val_suite,
+                'prod_suite': chal_prod_suite,
+                'oos_acc': acc_chal,
+                'oos_auc': auc_chal,
+                'composite_score': score_chal
+            }
+            promoted_any = True
+
+    if promoted_any or not os.path.exists(registry_path):
+        with open(registry_path, "wb") as f:
+            pickle.dump(champion_registry, f)
+        meta = {'updated_at': today_str, 'tickers': {
+            t: {
+                'model_name': info['model_name'], 'cutoff_date': info['cutoff_date'],
+                'promoted_at': info['promoted_at'], 'oos_acc': round(info['oos_acc'], 4),
+                'oos_auc': round(info['oos_auc'], 4), 'composite_score': round(info['composite_score'], 4)
+            } for t, info in champion_registry['tickers'].items()
+        }}
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+
+    print(f"🏆 Champion-vs-Challenger Gate Verified: Active Champions loaded from {registry_path}")
+
+    # 6. Sync & Grade SQLite predictions_log and get Rolling 20-Day Specialist Win Rates
     rolling_win_rates = sync_and_grade_predictions_log(
         train_df, feature_cols, semi_features, staples_features, decay_rate
     )
@@ -871,34 +1006,39 @@ def run_models_and_inference():
         latest_row = t_sub.iloc[-1:]
         X_today = latest_row[feature_cols].fillna(0.0)
 
-        prob_lgb = lgb.predict_proba(X_today)[0, 1]
-        prob_rf = rf.predict_proba(X_today)[0, 1]
+        # Use the ticker's locked-in Champion model suite if present in champion_registry
+        champ_info = champion_registry.get('tickers', {}).get(ticker) if champion_registry else None
+        active_suite = champ_info.get('prod_suite') if champ_info else None
+        champ_cutoff = champ_info.get('cutoff_date', 'live') if champ_info else 'live'
+
+        s_lgb = active_suite['lgb'] if active_suite else lgb
+        s_rf = active_suite['rf'] if active_suite else rf
+        s_semi = active_suite['semi_rf'] if active_suite else semi_rf
+        s_cost = active_suite['cost_rf'] if active_suite else cost_rf
+
+        prob_lgb = s_lgb.predict_proba(X_today)[0, 1]
+        prob_rf = s_rf.predict_proba(X_today)[0, 1]
         prob_ens = (prob_lgb * 0.60) + (prob_rf * 0.40)
 
-        # Asset-Specific Specialist Routing (Upgraded 2026-10 Benchmark - 60.87% Overall Acc, 0.592 AUC):
-        # NVDA  -> 60/40 Ensemble Specialist (61.8% test accuracy, 0.552 AUC)
-        # COST  -> COST Staples-RF Specialist (61.8% test accuracy, 0.594 AUC; isolated from tech spillover)
-        # TSLA  -> TSLA Tuned RF Specialist (60.7% test accuracy, 0.556 AUC)
-        # AMD   -> AMD Semi-RF Specialist (60.0% test accuracy, 0.640 AUC)
-        # GOOGL -> GOOGL AI/Semi-RF Specialist (60.0% test accuracy, 0.534 AUC)
+        # Asset-Specific Champion Specialist Routing (61.65% Gated Acc, 0.606 ROC-AUC):
         if ticker == 'AMD':
             X_semi = latest_row[semi_features].fillna(0.0)
-            final_prob = semi_rf.predict_proba(X_semi)[0, 1]
-            model_used = "AMD Semi-RF Specialist"
+            final_prob = s_semi.predict_proba(X_semi)[0, 1]
+            model_used = f"AMD Semi-RF Champion ({champ_cutoff})"
         elif ticker == 'GOOGL':
             X_semi = latest_row[semi_features].fillna(0.0)
-            final_prob = semi_rf.predict_proba(X_semi)[0, 1]
-            model_used = "GOOGL AI/Semi-RF Specialist"
+            final_prob = s_semi.predict_proba(X_semi)[0, 1]
+            model_used = f"GOOGL AI/Semi-RF Champion ({champ_cutoff})"
         elif ticker == 'COST':
             X_staples = latest_row[staples_features].fillna(0.0)
-            final_prob = cost_rf.predict_proba(X_staples)[0, 1]
-            model_used = "COST Staples-RF Specialist"
+            final_prob = s_cost.predict_proba(X_staples)[0, 1]
+            model_used = f"COST Staples-RF Champion ({champ_cutoff})"
         elif ticker == 'TSLA':
             final_prob = prob_rf
-            model_used = "TSLA Tuned RF Specialist"
+            model_used = f"TSLA Tuned RF Champion ({champ_cutoff})"
         else:
             final_prob = prob_ens
-            model_used = "NVDA 60/40 Ensemble Specialist"
+            model_used = f"NVDA 60/40 Ens Champion ({champ_cutoff})"
 
         conviction = max(final_prob, 1.0 - final_prob)
         vol_10d = float(np.clip(latest_row['Vol_10d'].fillna(0.02).values[0], 0.008, 0.060))

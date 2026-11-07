@@ -1,0 +1,45 @@
+{
+  "updated_at": "2026-11-06",
+  "tickers": {
+    "NVDA": {
+      "model_name": "NVDA 60/40 Ensemble Specialist",
+      "cutoff_date": "2026-11-04",
+      "promoted_at": "2026-11-06",
+      "oos_acc": 0.6429,
+      "oos_auc": 0.5652,
+      "composite_score": 0.6196
+    },
+    "TSLA": {
+      "model_name": "TSLA Tuned RF Specialist",
+      "cutoff_date": "2026-11-03",
+      "promoted_at": "2026-11-04",
+      "oos_acc": 0.625,
+      "oos_auc": 0.6166,
+      "composite_score": 0.6225
+    },
+    "AMD": {
+      "model_name": "AMD Semi-RF Specialist",
+      "cutoff_date": "2026-10-29",
+      "promoted_at": "2026-10-30",
+      "oos_acc": 0.6182,
+      "oos_auc": 0.6495,
+      "composite_score": 0.6276
+    },
+    "COST": {
+      "model_name": "COST Staples-RF Specialist",
+      "cutoff_date": "2026-10-29",
+      "promoted_at": "2026-10-30",
+      "oos_acc": 0.6071,
+      "oos_auc": 0.6016,
+      "composite_score": 0.6055
+    },
+    "GOOGL": {
+      "model_name": "GOOGL AI/Semi-RF Specialist",
+      "cutoff_date": "2026-10-29",
+      "promoted_at": "2026-10-30",
+      "oos_acc": 0.5893,
+      "oos_auc": 0.5472,
+      "composite_score": 0.5767
+    }
+  }
+}
