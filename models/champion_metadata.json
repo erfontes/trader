@@ -1,45 +1,45 @@
 {
-  "updated_at": "2026-11-12",
+  "updated_at": "2026-11-14",
   "tickers": {
     "NVDA": {
       "model_name": "NVDA 60/40 Ensemble Specialist",
-      "cutoff_date": "2026-11-10",
-      "promoted_at": "2026-11-12",
-      "oos_acc": 0.5965,
-      "oos_auc": 0.5763,
-      "composite_score": 0.5904
+      "cutoff_date": "2026-11-12",
+      "promoted_at": "2026-11-14",
+      "oos_acc": 0.614,
+      "oos_auc": 0.5859,
+      "composite_score": 0.6056
     },
     "TSLA": {
       "model_name": "TSLA Tuned RF Specialist",
       "cutoff_date": "2026-11-03",
       "promoted_at": "2026-11-04",
-      "oos_acc": 0.6491,
-      "oos_auc": 0.6863,
-      "composite_score": 0.6603
+      "oos_acc": 0.6552,
+      "oos_auc": 0.7139,
+      "composite_score": 0.6728
     },
     "AMD": {
       "model_name": "AMD Semi-RF Specialist",
       "cutoff_date": "2026-10-29",
       "promoted_at": "2026-10-30",
-      "oos_acc": 0.625,
-      "oos_auc": 0.6282,
-      "composite_score": 0.626
+      "oos_acc": 0.5789,
+      "oos_auc": 0.5988,
+      "composite_score": 0.5849
     },
     "COST": {
       "model_name": "COST Staples-RF Specialist",
       "cutoff_date": "2026-10-29",
       "promoted_at": "2026-10-30",
       "oos_acc": 0.5965,
-      "oos_auc": 0.5871,
-      "composite_score": 0.5937
+      "oos_auc": 0.5354,
+      "composite_score": 0.5781
     },
     "GOOGL": {
-      "model_name": "GOOGL AI/Semi-RF Specialist",
-      "cutoff_date": "2026-10-29",
-      "promoted_at": "2026-10-30",
-      "oos_acc": 0.5614,
-      "oos_auc": 0.4988,
-      "composite_score": 0.5426
+      "model_name": "GOOGL Mega-Cap AI Specialist",
+      "cutoff_date": "2026-11-12",
+      "promoted_at": "2026-11-14",
+      "oos_acc": 0.6316,
+      "oos_auc": 0.6086,
+      "composite_score": 0.6247
     }
   }
 }

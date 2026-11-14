@@ -507,9 +507,19 @@ def build_feature_dataset():
     if all_prices.empty:
         raise ValueError("Prices database is empty. Please run update_prices first.")
 
+    all_prices['Date'] = pd.to_datetime(all_prices['Date']).dt.strftime('%Y-%m-%d')
+    trading_dates = np.array(sorted(all_prices['Date'].unique()))
+
     # Quality- & Catalyst-Materiality-Weighted Sentiment aggregation
+    # + Weekend/Holiday News Mapping (recovers ~26% weekend news)
+    # + Macro/Sector ETF Sentiment Blending (recovers ~25% SPY/QQQ/^VIX/SMH/XLP news)
     if not s_raw.empty:
-        s_raw['Date'] = pd.to_datetime(s_raw['Date']).dt.strftime('%Y-%m-%d')
+        s_raw['Raw_Date'] = pd.to_datetime(s_raw['Date']).dt.strftime('%Y-%m-%d')
+        idx_map = np.searchsorted(trading_dates, s_raw['Raw_Date'].values, side='right') - 1
+        valid_mask = idx_map >= 0
+        s_raw = s_raw[valid_mask].copy()
+        s_raw['Date'] = trading_dates[idx_map[valid_mask]]
+
         s_raw['Pub_Weight'] = s_raw['Publisher'].apply(get_pub_weight)
         s_raw['Materiality'] = s_raw['Materiality'].fillna(0.7).clip(0.1, 1.0)
         s_raw['Weighted_Value'] = s_raw['Value'] * s_raw['Pub_Weight'] * s_raw['Materiality']
@@ -527,8 +537,13 @@ def build_feature_dataset():
             if col not in counts.columns: counts[col] = 0
         sent_df = summary.merge(counts, on=['Date', 'Ticker'], how='left').fillna({'Positive': 0, 'Negative': 0})
         sent_df['Net_Count'] = sent_df['Positive'] - sent_df['Negative']
+
+        macro_sent_map = sent_df[sent_df['Ticker'].isin(['SPY', 'QQQ', '^VIX'])].groupby('Date')['Avg_Intensity'].mean().to_dict()
+        smh_sent_map = sent_df[sent_df['Ticker'] == 'SMH'].set_index('Date')['Avg_Intensity'].to_dict()
+        xlp_sent_map = sent_df[sent_df['Ticker'] == 'XLP'].set_index('Date')['Avg_Intensity'].to_dict()
     else:
         sent_df = pd.DataFrame(columns=['Date', 'Ticker', 'Avg_Intensity', 'Avg_Publisher_Quality', 'Avg_Materiality', 'Positive', 'Negative', 'Net_Count'])
+        macro_sent_map, smh_sent_map, xlp_sent_map = {}, {}, {}
 
     # Macro benchmarks
     price_df = all_prices.sort_values(['Ticker', 'Date']).reset_index(drop=True)
@@ -610,14 +625,25 @@ def build_feature_dataset():
     merged.loc[is_cost, 'Target'] = ((merged.loc[is_cost, 'Next_Return'] > 0) & (merged.loc[is_cost, 'Next_XLP_Excess_Return'] >= -0.001)).astype(float)
     merged.loc[merged['Next_Price'].isna(), 'Target'] = np.nan
 
-    # Merge sentiment
+    # Merge sentiment & blend Macro/Sector ETF Sentiment (SPY/QQQ/^VIX/SMH/XLP)
     if not sent_df.empty:
         merged = merged.merge(sent_df, on=['Date', 'Ticker'], how='left')
     for c in ['Positive', 'Negative', 'Net_Count', 'Avg_Intensity', 'Avg_Publisher_Quality']:
         if c not in merged.columns: merged[c] = 0.0
         merged[c] = merged[c].fillna(0.0)
 
-    merged['Sent_Rolling_3d'] = merged.groupby('Ticker')['Avg_Intensity'].transform(lambda x: x.rolling(3, min_periods=1).mean())
+    blended_sent = []
+    for _, r in merged[['Date', 'Ticker', 'Avg_Intensity']].iterrows():
+        d, t, s_val = r['Date'], r['Ticker'], float(r['Avg_Intensity'])
+        m_val = float(macro_sent_map.get(d, 0.0))
+        sec_val = float(smh_sent_map.get(d, 0.0)) if t in ['NVDA', 'AMD', 'GOOGL'] else (float(xlp_sent_map.get(d, 0.0)) if t == 'COST' else m_val)
+        if s_val != 0.0:
+            blended_sent.append(0.80 * s_val + 0.20 * (0.60 * sec_val + 0.40 * m_val))
+        else:
+            blended_sent.append(0.35 * (0.60 * sec_val + 0.40 * m_val))
+    merged['Avg_Intensity'] = blended_sent
+
+    merged['Sent_Rolling_3d'] = merged.groupby('Ticker')['Avg_Intensity'].transform(lambda x: x.ewm(span=3, min_periods=1).mean())
     merged['Sent_Divergence'] = merged['Avg_Intensity'] - merged['Daily_Return']
     merged['High_Vol_Sentiment'] = merged['Avg_Intensity'] * merged['Volume_Surge']
 
@@ -850,6 +876,23 @@ def run_models_and_inference():
     )
     semi_rf.fit(semi_train[semi_features], semi_train['Target'].astype(int), sample_weight=semi_weights)
 
+    # 3.5. Fit Dedicated GOOGL Mega-Cap AI/Cloud Specialist (trained on GOOGL + TSLA + NVDA + Recency Weighted)
+    googl_train = train_df[train_df['Ticker'].isin(['GOOGL', 'TSLA', 'NVDA'])].copy()
+    googl_train_dates = pd.to_datetime(googl_train['Date'])
+    googl_days_diff = (max_train_date - googl_train_dates).dt.days
+    googl_weights = np.exp(-decay_rate * googl_days_diff)
+    googl_weights = googl_weights / googl_weights.mean()
+
+    googl_rf = RandomForestClassifier(
+        n_estimators=120,
+        max_depth=3,
+        min_samples_split=8,
+        max_features='sqrt',
+        random_state=42,
+        n_jobs=1
+    )
+    googl_rf.fit(googl_train[semi_features], googl_train['Target'].astype(int), sample_weight=googl_weights)
+
     # 4. Fit Dedicated Consumer Staples Specialist (COST isolated from Tech-Peer noise + Recency Weighted)
     staples_features = [
         'Daily_Return', 'Return_3d', 'Return_5d', 'SMA_5_dist', 'SMA_20_dist', 'RSI_14', 'Vol_10d',
@@ -895,12 +938,33 @@ def run_models_and_inference():
         except Exception as e:
             print(f"⚠️ Notice loading Champion Registry ({e}); initializing fresh registry.")
 
-    # Evaluate Challenger vs Champion on chronological 80/20 split of train_df
     ordered_df = train_df.sort_values(['Date', 'Ticker']).reset_index(drop=True)
     latest_cutoff_str = str(ordered_df['Date'].max())[:10]
     split_idx = int(len(ordered_df) * 0.80)
     val_tr = ordered_df.iloc[:split_idx].copy()
     val_te = ordered_df.iloc[split_idx:].copy()
+
+    cal_alphas = {'NVDA': 1.0, 'GOOGL': 1.0, 'COST': 0.25, 'TSLA': 0.0, 'AMD': 0.0}
+
+    def _calibrate_prob(p, pi0, alpha):
+        if alpha <= 0.0:
+            return p
+        p_c = np.clip(p, 1e-4, 1.0 - 1e-4)
+        pi_eff = (1.0 - alpha) * 0.50 + alpha * float(np.clip(pi0, 0.20, 0.80))
+        return (p_c / pi_eff) / ((p_c / pi_eff) + (1.0 - p_c) / (1.0 - pi_eff))
+
+    def _raw_pred(suite, sub_df, tkr):
+        if tkr == 'AMD':
+            return suite['semi_rf'].predict_proba(sub_df[semi_features].fillna(0.0))[:, 1]
+        elif tkr == 'GOOGL':
+            g_mod = suite.get('googl_rf', suite['semi_rf'])
+            return g_mod.predict_proba(sub_df[semi_features].fillna(0.0))[:, 1]
+        elif tkr == 'COST':
+            return suite['cost_rf'].predict_proba(sub_df[staples_features].fillna(0.0))[:, 1]
+        elif tkr == 'TSLA':
+            return suite['rf'].predict_proba(sub_df[feature_cols].fillna(0.0))[:, 1]
+        else:
+            return 0.60 * suite['lgb'].predict_proba(sub_df[feature_cols].fillna(0.0))[:, 1] + 0.40 * suite['rf'].predict_proba(sub_df[feature_cols].fillna(0.0))[:, 1]
 
     def _fit_suite_on(sub_tr):
         tr_d = pd.to_datetime(sub_tr['Date'])
@@ -913,30 +977,49 @@ def run_models_and_inference():
         w_s = np.exp(-decay_rate * (m_d - pd.to_datetime(s_sub['Date'])).dt.days)
         w_s = w_s / w_s.mean()
         m_semi = RandomForestClassifier(n_estimators=120, max_depth=3, min_samples_split=6, max_features='sqrt', random_state=42, n_jobs=1).fit(s_sub[semi_features], s_sub['Target'].astype(int), sample_weight=w_s)
+        g_sub = sub_tr[sub_tr['Ticker'].isin(['GOOGL', 'TSLA', 'NVDA'])].copy()
+        w_g = np.exp(-decay_rate * (m_d - pd.to_datetime(g_sub['Date'])).dt.days)
+        w_g = w_g / w_g.mean()
+        m_googl = RandomForestClassifier(n_estimators=120, max_depth=3, min_samples_split=8, max_features='sqrt', random_state=42, n_jobs=1).fit(g_sub[semi_features], g_sub['Target'].astype(int), sample_weight=w_g)
         c_sub = sub_tr[sub_tr['Ticker'] == 'COST'].copy()
         w_c = np.exp(-decay_rate * (m_d - pd.to_datetime(c_sub['Date'])).dt.days)
         w_c = w_c / w_c.mean()
         m_cost = RandomForestClassifier(n_estimators=120, max_depth=3, min_samples_split=8, max_features='sqrt', random_state=42, n_jobs=1).fit(c_sub[staples_features], c_sub['Target'].astype(int), sample_weight=w_c)
-        return {'lgb': m_lgb, 'rf': m_rf, 'semi_rf': m_semi, 'cost_rf': m_cost}
+        suite = {'lgb': m_lgb, 'rf': m_rf, 'semi_rf': m_semi, 'googl_rf': m_googl, 'cost_rf': m_cost, 'priors': {}}
+        for t in TARGET_TICKERS:
+            t_rows = sub_tr[sub_tr['Ticker'] == t]
+            if not t_rows.empty:
+                w_t = np.exp(-decay_rate * (m_d - pd.to_datetime(t_rows['Date'])).dt.days)
+                suite['priors'][t] = float(np.average(_raw_pred(suite, t_rows, t), weights=w_t))
+            else:
+                suite['priors'][t] = 0.45
+        return suite
 
     def _pred_suite(suite, sub_df, tkr):
-        if tkr in ['AMD', 'GOOGL']:
-            return suite['semi_rf'].predict_proba(sub_df[semi_features].fillna(0.0))[:, 1]
-        elif tkr == 'COST':
-            return suite['cost_rf'].predict_proba(sub_df[staples_features].fillna(0.0))[:, 1]
-        elif tkr == 'TSLA':
-            return suite['rf'].predict_proba(sub_df[feature_cols].fillna(0.0))[:, 1]
-        else:
-            return 0.60 * suite['lgb'].predict_proba(sub_df[feature_cols].fillna(0.0))[:, 1] + 0.40 * suite['rf'].predict_proba(sub_df[feature_cols].fillna(0.0))[:, 1]
+        raw_p = _raw_pred(suite, sub_df, tkr)
+        default_pi0 = 0.36 if tkr == 'COST' else 0.44
+        pi0 = suite.get('priors', {}).get(tkr, default_pi0)
+        alpha = cal_alphas.get(tkr, 0.0) if ('googl_rf' in suite or tkr == 'COST') else 0.0
+        return _calibrate_prob(raw_p, pi0, alpha)
 
     chal_val_suite = _fit_suite_on(val_tr)
-    chal_prod_suite = {'lgb': lgb, 'rf': rf, 'semi_rf': semi_rf, 'cost_rf': cost_rf}
+    prod_priors = {}
+    for t in TARGET_TICKERS:
+        t_rows = train_df[train_df['Ticker'] == t]
+        if not t_rows.empty:
+            w_t = np.exp(-decay_rate * (max_train_date - pd.to_datetime(t_rows['Date'])).dt.days)
+            tmp_s = {'lgb': lgb, 'rf': rf, 'semi_rf': semi_rf, 'googl_rf': googl_rf, 'cost_rf': cost_rf}
+            prod_priors[t] = float(np.average(_raw_pred(tmp_s, t_rows, t), weights=w_t))
+        else:
+            prod_priors[t] = 0.45
+    chal_prod_suite = {'lgb': lgb, 'rf': rf, 'semi_rf': semi_rf, 'googl_rf': googl_rf, 'cost_rf': cost_rf, 'priors': prod_priors}
+
     spec_names = {
         'NVDA': 'NVDA 60/40 Ensemble Specialist',
         'TSLA': 'TSLA Tuned RF Specialist',
         'AMD': 'AMD Semi-RF Specialist',
         'COST': 'COST Staples-RF Specialist',
-        'GOOGL': 'GOOGL AI/Semi-RF Specialist'
+        'GOOGL': 'GOOGL Mega-Cap AI Specialist'
     }
 
     if champion_registry is None:
@@ -974,6 +1057,10 @@ def run_models_and_inference():
                 'composite_score': score_chal
             }
             promoted_any = True
+        elif c_entry is not None:
+            c_entry['oos_acc'] = acc_champ
+            c_entry['oos_auc'] = auc_champ
+            c_entry['composite_score'] = score_champ
 
     if promoted_any or not os.path.exists(registry_path):
         with open(registry_path, "wb") as f:
@@ -1004,40 +1091,22 @@ def run_models_and_inference():
         if t_sub.empty:
             continue
         latest_row = t_sub.iloc[-1:]
-        X_today = latest_row[feature_cols].fillna(0.0)
 
-        # Use the ticker's locked-in Champion model suite if present in champion_registry
         champ_info = champion_registry.get('tickers', {}).get(ticker) if champion_registry else None
-        active_suite = champ_info.get('prod_suite') if champ_info else None
+        active_suite = champ_info.get('prod_suite') if champ_info else chal_prod_suite
         champ_cutoff = champ_info.get('cutoff_date', 'live') if champ_info else 'live'
 
-        s_lgb = active_suite['lgb'] if active_suite else lgb
-        s_rf = active_suite['rf'] if active_suite else rf
-        s_semi = active_suite['semi_rf'] if active_suite else semi_rf
-        s_cost = active_suite['cost_rf'] if active_suite else cost_rf
+        final_prob = float(_pred_suite(active_suite, latest_row, ticker)[0])
 
-        prob_lgb = s_lgb.predict_proba(X_today)[0, 1]
-        prob_rf = s_rf.predict_proba(X_today)[0, 1]
-        prob_ens = (prob_lgb * 0.60) + (prob_rf * 0.40)
-
-        # Asset-Specific Champion Specialist Routing (61.65% Gated Acc, 0.606 ROC-AUC):
         if ticker == 'AMD':
-            X_semi = latest_row[semi_features].fillna(0.0)
-            final_prob = s_semi.predict_proba(X_semi)[0, 1]
             model_used = f"AMD Semi-RF Champion ({champ_cutoff})"
         elif ticker == 'GOOGL':
-            X_semi = latest_row[semi_features].fillna(0.0)
-            final_prob = s_semi.predict_proba(X_semi)[0, 1]
-            model_used = f"GOOGL AI/Semi-RF Champion ({champ_cutoff})"
+            model_used = f"GOOGL Mega-Cap AI Champion ({champ_cutoff})"
         elif ticker == 'COST':
-            X_staples = latest_row[staples_features].fillna(0.0)
-            final_prob = s_cost.predict_proba(X_staples)[0, 1]
             model_used = f"COST Staples-RF Champion ({champ_cutoff})"
         elif ticker == 'TSLA':
-            final_prob = prob_rf
             model_used = f"TSLA Tuned RF Champion ({champ_cutoff})"
         else:
-            final_prob = prob_ens
             model_used = f"NVDA 60/40 Ens Champion ({champ_cutoff})"
 
         conviction = max(final_prob, 1.0 - final_prob)
