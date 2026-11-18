@@ -1116,17 +1116,17 @@ def run_models_and_inference():
         # Volatility-Scaled Stop-Loss (0.85x 10D daily volatility, bounded between 1.0% and 2.5%)
         stop_loss_pct = round(float(np.clip(vol_10d * 100.0 * 0.85, 1.0, 2.5)), 2)
 
-        # Decision rule & conviction tier tailored specifically for 9:15 - 9:30 AM EST execution
+        # Decision rule & conviction tier tailored specifically for 9:30 - 9:45 AM EST execution
         if final_prob >= 0.55:
             action = "BUY / LONG"
             color = "#10b981"
-            badge = "🟢 LONG (9:15-9:30)"
+            badge = "🟢 LONG (9:30-9:45)"
             bias = "📈 Bullish Rally"
             plan = f"Enter Long at open; hard stop -{stop_loss_pct:.2f}%"
         elif final_prob <= 0.45:
             action = "SHORT / FADE"
             color = "#ef4444"
-            badge = "🔴 SHORT (9:15-9:30)"
+            badge = "🔴 SHORT (9:30-9:45)"
             bias = "📉 Bearish Drop"
             plan = f"Fade open / Short; hard stop +{stop_loss_pct:.2f}%"
         else:
@@ -1223,7 +1223,7 @@ def generate_gemma4_narrative(inferences, macro_info):
     prompt = f"""
 You are an elite quantitative portfolio manager writing the Pre-Market Trading Briefing for the lead trader.
 Market Session: {macro_info['Date']}
-CRITICAL EXECUTION WINDOW: 9:15 AM - 9:30 AM EST (Market Open Action)
+CRITICAL EXECUTION WINDOW: 9:30 AM - 9:45 AM EST (Market Open Action)
 
 MACRO REGIME:
 - VIX: {macro_info['VIX']:.2f} ({macro_info['VIX_Change']:+.2f}%)
@@ -1235,14 +1235,14 @@ QUANTITATIVE ML ENSEMBLE PREDICTIONS & VOL-KELLY POSITION SIZING:
 {stocks_text}
 
 Provide an executive trading note formatted in clean HTML (use <p>, <ul>, <li>, <strong> only):
-1. <strong>Macro & Volatility Climate</strong>: 2 concise sentences on market risk regime and recommended capital deployment ({macro_info.get('Total_Alloc_Pct', 0.0):.1f}% invested) heading into the 9:15-9:30 AM open.
-2. <strong>Tactical Positioning & 9:15-9:30 AM Setups</strong>: 1-2 bullet points per key stock detailing the exact trade execution, including its Volatility-Adjusted Kelly Size (% of capital) and Dynamic Vol Stop (%):
+1. <strong>Macro & Volatility Climate</strong>: 2 concise sentences on market risk regime and recommended capital deployment ({macro_info.get('Total_Alloc_Pct', 0.0):.1f}% invested) heading into the 9:30-9:45 AM open.
+2. <strong>Tactical Positioning & 9:30-9:45 AM Setups</strong>: 1-2 bullet points per key stock detailing the exact trade execution, including its Volatility-Adjusted Kelly Size (% of capital) and Dynamic Vol Stop (%):
    - For 🔴 SHORT: explicitly advise fading the morning open or shorting overextended moves (expecting price decline).
    - For 🟢 LONG: explicitly advise buying the open or morning dip for upside momentum & alpha outperformance.
    - For ⚪ PASS: state why capital should remain in cash/sidelined.
-3. <strong>Highest Conviction Play & Risk Rules</strong>: Highlight the single top risk-adjusted trade (highest Kelly allocation & conviction) for the 9:15-9:30 AM open and enforce its volatility-calibrated hard stop-loss.
+3. <strong>Highest Conviction Play & Risk Rules</strong>: Highlight the single top risk-adjusted trade (highest Kelly allocation & conviction) for the 9:30-9:45 AM open and enforce its volatility-calibrated hard stop-loss.
 
-Keep it sharp, professional, and directly actionable for the 9:15-9:30 AM EST open.
+Keep it sharp, professional, and directly actionable for the 9:30-9:45 AM EST open.
 """
     payload = {
         "model": "gemma4:31b",
@@ -1331,7 +1331,7 @@ def generate_html_report(inferences, macro_info, gemma_narrative=None):
                     </h1>
                 </div>
                 <p style="margin: 6px 0 0 0; font-size: 13px; color: #94a3b8;">
-                    Market Session: <strong style="color: #f8fafc;">{macro_info['Date']}</strong> | Execution Window: <strong style="color: #38bdf8;">9:15 – 9:30 AM EST</strong> | Specialist Router + Vol-Kelly Sizing
+                    Market Session: <strong style="color: #f8fafc;">{macro_info['Date']}</strong> | Execution Window: <strong style="color: #38bdf8;">9:30 – 9:45 AM EST</strong> | Specialist Router + Vol-Kelly Sizing
                 </p>
             </div>
 
@@ -1347,13 +1347,13 @@ def generate_html_report(inferences, macro_info, gemma_narrative=None):
 
             <!-- Actions Table -->
             <div style="padding: 24px;">
-                <h2 style="font-size: 16px; margin: 0 0 14px 0; color: #f8fafc;">🎯 Recommended Actions, Kelly Sizing & Vol Stops (9:15 – 9:30 AM EST)</h2>
+                <h2 style="font-size: 16px; margin: 0 0 14px 0; color: #f8fafc;">🎯 Recommended Actions, Kelly Sizing & Vol Stops (9:30 – 9:45 AM EST)</h2>
                 <div style="overflow-x: auto;">
                     <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 14px;">
                         <thead>
                             <tr style="background-color: #0f172a; color: #94a3b8; font-size: 12px; text-transform: uppercase;">
                                 <th style="padding: 10px 14px;">Ticker</th>
-                                <th style="padding: 10px 14px; text-align: center;">Signal (9:15-9:30)</th>
+                                <th style="padding: 10px 14px; text-align: center;">Signal (9:30-9:45)</th>
                                 <th style="padding: 10px 14px; text-align: right;">Conviction</th>
                                 <th style="padding: 10px 14px; text-align: right;">Size (% Cap)</th>
                                 <th style="padding: 10px 14px; text-align: right;">Vol Stop</th>
@@ -1371,8 +1371,8 @@ def generate_html_report(inferences, macro_info, gemma_narrative=None):
 
                 <!-- Guidance notes -->
                 <div style="margin-top: 24px; padding: 16px; background-color: #0f172a; border-radius: 8px; border-left: 4px solid #38bdf8; font-size: 13px; line-height: 1.5; color: #94a3b8;">
-                    <strong style="color: #38bdf8;">📌 9:15 – 9:30 AM EST Tactical Execution & Kelly Sizing Rules:</strong><br>
-                    • <strong>🟢 LONG (Buy Open)</strong>: Directional Alpha target &ge; 55%. Buy during the 9:15-9:30 AM open window to capture momentum & relative outperformance.<br>
+                    <strong style="color: #38bdf8;">📌 9:30 – 9:45 AM EST Tactical Execution & Kelly Sizing Rules:</strong><br>
+                    • <strong>🟢 LONG (Buy Open)</strong>: Directional Alpha target &ge; 55%. Buy during the 9:30-9:45 AM open window to capture momentum & relative outperformance.<br>
                     • <strong>🔴 SHORT (Fade Open)</strong>: Directional Alpha target &le; 45%. Fade overextended morning moves or enter short for downside mean-reversion.<br>
                     • <strong>📐 Size (% Cap)</strong>: Volatility-Adjusted Fractional Kelly allocation scaled by each specialist's rolling 20-day realized win rate (capped at 30% per asset).<br>
                     • <strong>🛡️ Vol Stop</strong>: Volatility-calibrated hard stop-loss (`0.85 × Vol_10d`, bounded 1.0% – 2.5%). Never average down on an adverse opening move.
