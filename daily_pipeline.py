@@ -35,7 +35,10 @@ from xml.etree import ElementTree as ET
 import concurrent.futures
 
 from lightgbm import LGBMClassifier
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
 
 # ==============================================================================
 # 1. Configuration & Paths
@@ -672,6 +675,18 @@ def build_feature_dataset():
     nvda_sub = merged[merged['Ticker'] == 'NVDA'][['Date', 'Daily_Return', 'Avg_Intensity']].rename(columns={'Daily_Return': 'NVDA_Lead_Return', 'Avg_Intensity': 'NVDA_Lead_Sent'})
     merged = merged.merge(nvda_sub, on='Date', how='left')
 
+    # Volatility-Normalized Z-Scores, Cross-Sectional Rank, Materiality/Disagreement & Calendar
+    merged['Ret_Z'] = (merged['Daily_Return'] / (merged['Vol_10d'] + 1e-4)).fillna(0.0)
+    merged['Ret5_Z'] = (merged['Return_5d'] / (merged['Vol_10d'] * np.sqrt(5.0) + 1e-4)).fillna(0.0)
+    merged['Gap_Z'] = (merged['Overnight_Gap'] / (merged['Vol_10d'] + 1e-4)).fillna(0.0)
+    merged['Sent_Mom'] = (merged['Avg_Intensity'] - merged['Sent_Rolling_3d']).fillna(0.0)
+    merged['Rank_Ret5'] = merged.groupby('Date')['Return_5d'].rank(pct=True).fillna(0.5)
+    for extra_c in ['Avg_Materiality', 'Avg_Disagreement']:
+        if extra_c not in merged.columns:
+            merged[extra_c] = 0.0
+        merged[extra_c] = merged[extra_c].fillna(0.0)
+    merged['DayOfWeek'] = pd.to_datetime(merged['Date']).dt.dayofweek.astype(float)
+
     return merged
 
 def sync_and_grade_predictions_log(train_df, feature_cols, semi_features, staples_features, decay_rate):
@@ -796,10 +811,11 @@ def sync_and_grade_predictions_log(train_df, feature_cols, semi_features, staple
 
 
 def run_models_and_inference():
-    print("⚙️ Step 4: Engineering 36 Alpha Signals & Generating Pre-Market Inferences...")
+    print("⚙️ Step 4: Engineering 44 Alpha Signals & Generating Pre-Market Inferences...")
     df = build_feature_dataset()
 
-    feature_cols = [
+    # Legacy 36/27/24 feature lists (preserved so stored Champions evaluate apples-to-apples)
+    base_feature_cols = [
         'Daily_Return', 'Return_3d', 'Return_5d', 'SMA_5_dist', 'SMA_20_dist', 'RSI_14', 'Vol_10d',
         'Overnight_Gap', 'Intraday_Return', 'Daily_Range', 'CLV', 'Volume_Surge',
         'SPY_Return', 'QQQ_Return', 'Excess_Return', 'VIX_Close', 'VIX_Daily_Change',
@@ -808,51 +824,7 @@ def run_models_and_inference():
         'High_Vol_Sentiment', 'Rolling_Beta_SPY_20d', 'Rolling_Corr_SPY_20d',
         'Peer_Tech_Avg_Return', 'Peer_Tech_Avg_Sent', 'NVDA_Lead_Return', 'NVDA_Lead_Sent'
     ]
-
-    # Clean historical training set (all rows where Target is known)
-    train_df = df.dropna(subset=['Target', 'Daily_Return', 'Overnight_Gap', 'Volume_Surge', 'RSI_14', 'Rolling_Beta_SPY_20d']).copy()
-    X_train = train_df[feature_cols]
-    y_train = train_df['Target'].astype(int)
-
-    # -------------------------------------------------------------
-    # Recency Adaptation: Exponential Decay Sample Weights
-    # Half-life configurable via RECENCY_HALF_LIFE_DAYS (default: 60 days)
-    # -------------------------------------------------------------
-    recency_half_life = float(os.getenv("RECENCY_HALF_LIFE_DAYS", "60.0"))
-    train_dates = pd.to_datetime(train_df['Date'])
-    max_train_date = train_dates.max()
-    days_diff = (max_train_date - train_dates).dt.days
-    decay_rate = np.log(2.0) / max(recency_half_life, 1.0)
-    sample_weights = np.exp(-decay_rate * days_diff)
-    sample_weights = sample_weights / sample_weights.mean()
-
-    # 1. Fit Tuned LightGBM (Regularized for noise reduction + Recency Weighted)
-    lgb = LGBMClassifier(
-        n_estimators=60,
-        max_depth=3,
-        learning_rate=0.015,
-        colsample_bytree=0.8,
-        subsample=0.7,
-        min_child_samples=15,
-        random_state=42,
-        n_jobs=1,
-        verbose=-1
-    )
-    lgb.fit(X_train, y_train, sample_weight=sample_weights)
-
-    # 2. Fit Tuned Random Forest (Capped depth=3 to prevent leaf overfitting + Recency Weighted)
-    rf = RandomForestClassifier(
-        n_estimators=100,
-        max_depth=3,
-        min_samples_split=8,
-        max_features='sqrt',
-        random_state=42,
-        n_jobs=1
-    )
-    rf.fit(X_train, y_train, sample_weight=sample_weights)
-
-    # 3. Fit Dedicated Semiconductor / AI-Tech Specialist (NVDA, AMD & GOOGL + Recency Weighted)
-    semi_features = [
+    base_semi_features = [
         'Daily_Return', 'Return_3d', 'Return_5d', 'SMA_5_dist', 'SMA_20_dist', 'RSI_14', 'Vol_10d',
         'Overnight_Gap', 'Intraday_Return', 'Daily_Range', 'CLV', 'Volume_Surge',
         'SPY_Return', 'QQQ_Return', 'SMH_Return', 'SMH_Excess_Return', 'SMH_Beta_20d',
@@ -860,41 +832,7 @@ def run_models_and_inference():
         'Avg_Intensity', 'Sent_Rolling_3d', 'Sent_Divergence', 'High_Vol_Sentiment',
         'Peer_Tech_Avg_Return', 'Peer_Tech_Avg_Sent', 'NVDA_Lead_Return', 'NVDA_Lead_Sent'
     ]
-    semi_train = train_df[train_df['Ticker'].isin(['NVDA', 'AMD'])].copy()
-    semi_train_dates = pd.to_datetime(semi_train['Date'])
-    semi_days_diff = (max_train_date - semi_train_dates).dt.days
-    semi_weights = np.exp(-decay_rate * semi_days_diff)
-    semi_weights = semi_weights / semi_weights.mean()
-
-    semi_rf = RandomForestClassifier(
-        n_estimators=120,
-        max_depth=3,
-        min_samples_split=6,
-        max_features='sqrt',
-        random_state=42,
-        n_jobs=1
-    )
-    semi_rf.fit(semi_train[semi_features], semi_train['Target'].astype(int), sample_weight=semi_weights)
-
-    # 3.5. Fit Dedicated GOOGL Mega-Cap AI/Cloud Specialist (trained on GOOGL + TSLA + NVDA + Recency Weighted)
-    googl_train = train_df[train_df['Ticker'].isin(['GOOGL', 'TSLA', 'NVDA'])].copy()
-    googl_train_dates = pd.to_datetime(googl_train['Date'])
-    googl_days_diff = (max_train_date - googl_train_dates).dt.days
-    googl_weights = np.exp(-decay_rate * googl_days_diff)
-    googl_weights = googl_weights / googl_weights.mean()
-
-    googl_rf = RandomForestClassifier(
-        n_estimators=120,
-        max_depth=3,
-        min_samples_split=8,
-        max_features='sqrt',
-        random_state=42,
-        n_jobs=1
-    )
-    googl_rf.fit(googl_train[semi_features], googl_train['Target'].astype(int), sample_weight=googl_weights)
-
-    # 4. Fit Dedicated Consumer Staples Specialist (COST isolated from Tech-Peer noise + Recency Weighted)
-    staples_features = [
+    base_staples_features = [
         'Daily_Return', 'Return_3d', 'Return_5d', 'SMA_5_dist', 'SMA_20_dist', 'RSI_14', 'Vol_10d',
         'Overnight_Gap', 'Intraday_Return', 'Daily_Range', 'CLV', 'Volume_Surge',
         'SPY_Return', 'Excess_Return', 'XLP_Return', 'XLP_Excess_Return',
@@ -902,26 +840,27 @@ def run_models_and_inference():
         'Avg_Intensity', 'Sent_Rolling_3d', 'Sent_Divergence', 'High_Vol_Sentiment',
         'Rolling_Beta_SPY_20d', 'Rolling_Corr_SPY_20d'
     ]
-    cost_train = train_df[train_df['Ticker'] == 'COST'].copy()
-    cost_train_dates = pd.to_datetime(cost_train['Date'])
-    cost_days_diff = (max_train_date - cost_train_dates).dt.days
-    cost_weights = np.exp(-decay_rate * cost_days_diff)
-    cost_weights = cost_weights / cost_weights.mean()
 
-    cost_rf = RandomForestClassifier(
-        n_estimators=120,
-        max_depth=3,
-        min_samples_split=8,
-        max_features='sqrt',
-        random_state=42,
-        n_jobs=1
-    )
-    cost_rf.fit(cost_train[staples_features], cost_train['Target'].astype(int), sample_weight=cost_weights)
+    # Upgraded 44/35/30 feature lists (Vol Z-Scores, Cross-Sectional Rank, Materiality, Disagreement, DOW)
+    extra_all = ['Ret_Z', 'Ret5_Z', 'Gap_Z', 'Sent_Mom', 'Rank_Ret5', 'Avg_Materiality', 'Avg_Disagreement', 'DayOfWeek']
+    extra_staples = ['Ret_Z', 'Ret5_Z', 'Gap_Z', 'Sent_Mom', 'Avg_Materiality', 'DayOfWeek']
+    feature_cols = base_feature_cols + extra_all
+    semi_features = base_semi_features + extra_all
+    staples_features = base_staples_features + extra_staples
+
+    # Clean historical training set (all rows where Target is known)
+    train_df = df.dropna(subset=['Target', 'Daily_Return', 'Overnight_Gap', 'Volume_Surge', 'RSI_14', 'Rolling_Beta_SPY_20d']).copy()
+
+    # -------------------------------------------------------------
+    # Recency Adaptation: Exponential Decay Sample Weights
+    # Half-life configurable via RECENCY_HALF_LIFE_DAYS (default: 60 days)
+    # -------------------------------------------------------------
+    recency_half_life = float(os.getenv("RECENCY_HALF_LIFE_DAYS", "60.0"))
+    decay_rate = np.log(2.0) / max(recency_half_life, 1.0)
 
     # 5. Automatic Champion-vs-Challenger Gate (models/champion_registry.pkl)
-    #    Both gather_train.ipynb (Cell 22) and daily_pipeline.py automatically evaluate
-    #    new Challenger models against the saved Champion on the 20% OOS holdout window
-    #    and only promote a Challenger if (0.70*Acc + 0.30*AUC) strictly improves.
+    #    Strict rule: A Challenger ONLY replaces a Champion if AUC >= 0.52 AND
+    #    composite score (0.70*Acc + 0.30*AUC) strictly beats Champion by > 0.002.
     models_dir = os.path.join(BASE_DIR, "models")
     os.makedirs(models_dir, exist_ok=True)
     registry_path = os.path.join(models_dir, "champion_registry.pkl")
@@ -954,38 +893,87 @@ def run_models_and_inference():
         return (p_c / pi_eff) / ((p_c / pi_eff) + (1.0 - p_c) / (1.0 - pi_eff))
 
     def _raw_pred(suite, sub_df, tkr):
+        s_cols = suite.get('cols', {})
+        f_c = s_cols.get('feature_cols', base_feature_cols)
+        s_c = s_cols.get('semi_features', base_semi_features)
+        c_c = s_cols.get('staples_features', base_staples_features)
         if tkr == 'AMD':
-            return suite['semi_rf'].predict_proba(sub_df[semi_features].fillna(0.0))[:, 1]
+            p_rf = suite['semi_rf'].predict_proba(sub_df[s_c].fillna(0.0))[:, 1]
+            if 'semi_et' in suite and 'semi_lr' in suite:
+                p_et = suite['semi_et'].predict_proba(sub_df[s_c].fillna(0.0))[:, 1]
+                p_lr = suite['semi_lr'].predict_proba(sub_df[s_c].fillna(0.0))[:, 1]
+                return 0.45 * p_rf + 0.25 * p_et + 0.30 * p_lr
+            return p_rf
         elif tkr == 'GOOGL':
             g_mod = suite.get('googl_rf', suite['semi_rf'])
-            return g_mod.predict_proba(sub_df[semi_features].fillna(0.0))[:, 1]
+            p_rf = g_mod.predict_proba(sub_df[s_c].fillna(0.0))[:, 1]
+            if 'googl_et' in suite and 'googl_lr' in suite:
+                p_et = suite['googl_et'].predict_proba(sub_df[s_c].fillna(0.0))[:, 1]
+                p_lr = suite['googl_lr'].predict_proba(sub_df[s_c].fillna(0.0))[:, 1]
+                return 0.45 * p_rf + 0.25 * p_et + 0.30 * p_lr
+            return p_rf
         elif tkr == 'COST':
-            return suite['cost_rf'].predict_proba(sub_df[staples_features].fillna(0.0))[:, 1]
+            p_rf = suite['cost_rf'].predict_proba(sub_df[c_c].fillna(0.0))[:, 1]
+            if 'cost_et' in suite and 'cost_lr' in suite:
+                p_et = suite['cost_et'].predict_proba(sub_df[c_c].fillna(0.0))[:, 1]
+                p_lr = suite['cost_lr'].predict_proba(sub_df[c_c].fillna(0.0))[:, 1]
+                return 0.45 * p_rf + 0.25 * p_et + 0.30 * p_lr
+            return p_rf
         elif tkr == 'TSLA':
-            return suite['rf'].predict_proba(sub_df[feature_cols].fillna(0.0))[:, 1]
+            p_rf = suite['rf'].predict_proba(sub_df[f_c].fillna(0.0))[:, 1]
+            if 'et' in suite and 'lr' in suite:
+                p_et = suite['et'].predict_proba(sub_df[f_c].fillna(0.0))[:, 1]
+                p_lr = suite['lr'].predict_proba(sub_df[f_c].fillna(0.0))[:, 1]
+                return 0.40 * p_rf + 0.30 * p_et + 0.30 * p_lr
+            return p_rf
         else:
-            return 0.60 * suite['lgb'].predict_proba(sub_df[feature_cols].fillna(0.0))[:, 1] + 0.40 * suite['rf'].predict_proba(sub_df[feature_cols].fillna(0.0))[:, 1]
+            return 0.60 * suite['lgb'].predict_proba(sub_df[f_c].fillna(0.0))[:, 1] + 0.40 * suite['rf'].predict_proba(sub_df[f_c].fillna(0.0))[:, 1]
 
     def _fit_suite_on(sub_tr):
         tr_d = pd.to_datetime(sub_tr['Date'])
         m_d = tr_d.max()
         w_all = np.exp(-decay_rate * (m_d - tr_d).dt.days)
         w_all = w_all / w_all.mean()
-        m_lgb = LGBMClassifier(n_estimators=60, max_depth=3, learning_rate=0.015, colsample_bytree=0.8, subsample=0.7, min_child_samples=15, random_state=42, n_jobs=1, verbose=-1).fit(sub_tr[feature_cols], sub_tr['Target'].astype(int), sample_weight=w_all)
-        m_rf = RandomForestClassifier(n_estimators=100, max_depth=3, min_samples_split=8, max_features='sqrt', random_state=42, n_jobs=1).fit(sub_tr[feature_cols], sub_tr['Target'].astype(int), sample_weight=w_all)
+        X_all = sub_tr[feature_cols].fillna(0.0)
+        y_all = sub_tr['Target'].astype(int)
+
+        m_lgb = LGBMClassifier(n_estimators=60, max_depth=3, learning_rate=0.015, colsample_bytree=0.8, subsample=0.7, min_child_samples=15, random_state=42, n_jobs=1, verbose=-1).fit(X_all, y_all, sample_weight=w_all)
+        m_rf = RandomForestClassifier(n_estimators=100, max_depth=3, min_samples_split=8, max_features='sqrt', random_state=42, n_jobs=1).fit(X_all, y_all, sample_weight=w_all)
+        m_et = ExtraTreesClassifier(n_estimators=150, max_depth=4, min_samples_split=8, max_features='sqrt', random_state=42, n_jobs=1).fit(X_all, y_all, sample_weight=w_all)
+        m_lr = make_pipeline(StandardScaler(), LogisticRegression(C=0.05, max_iter=500)).fit(X_all, y_all, logisticregression__sample_weight=w_all)
+
         s_sub = sub_tr[sub_tr['Ticker'].isin(['NVDA', 'AMD'])].copy()
         w_s = np.exp(-decay_rate * (m_d - pd.to_datetime(s_sub['Date'])).dt.days)
         w_s = w_s / w_s.mean()
-        m_semi = RandomForestClassifier(n_estimators=120, max_depth=3, min_samples_split=6, max_features='sqrt', random_state=42, n_jobs=1).fit(s_sub[semi_features], s_sub['Target'].astype(int), sample_weight=w_s)
+        Xs, ys = s_sub[semi_features].fillna(0.0), s_sub['Target'].astype(int)
+        m_semi = RandomForestClassifier(n_estimators=120, max_depth=3, min_samples_split=6, max_features='sqrt', random_state=42, n_jobs=1).fit(Xs, ys, sample_weight=w_s)
+        m_semi_et = ExtraTreesClassifier(n_estimators=150, max_depth=4, min_samples_split=6, max_features='sqrt', random_state=42, n_jobs=1).fit(Xs, ys, sample_weight=w_s)
+        m_semi_lr = make_pipeline(StandardScaler(), LogisticRegression(C=0.05, max_iter=500)).fit(Xs, ys, logisticregression__sample_weight=w_s)
+
         g_sub = sub_tr[sub_tr['Ticker'].isin(['GOOGL', 'TSLA', 'NVDA'])].copy()
         w_g = np.exp(-decay_rate * (m_d - pd.to_datetime(g_sub['Date'])).dt.days)
         w_g = w_g / w_g.mean()
-        m_googl = RandomForestClassifier(n_estimators=120, max_depth=3, min_samples_split=8, max_features='sqrt', random_state=42, n_jobs=1).fit(g_sub[semi_features], g_sub['Target'].astype(int), sample_weight=w_g)
+        Xg, yg = g_sub[semi_features].fillna(0.0), g_sub['Target'].astype(int)
+        m_googl = RandomForestClassifier(n_estimators=120, max_depth=3, min_samples_split=8, max_features='sqrt', random_state=42, n_jobs=1).fit(Xg, yg, sample_weight=w_g)
+        m_googl_et = ExtraTreesClassifier(n_estimators=150, max_depth=4, min_samples_split=8, max_features='sqrt', random_state=42, n_jobs=1).fit(Xg, yg, sample_weight=w_g)
+        m_googl_lr = make_pipeline(StandardScaler(), LogisticRegression(C=0.05, max_iter=500)).fit(Xg, yg, logisticregression__sample_weight=w_g)
+
         c_sub = sub_tr[sub_tr['Ticker'] == 'COST'].copy()
         w_c = np.exp(-decay_rate * (m_d - pd.to_datetime(c_sub['Date'])).dt.days)
         w_c = w_c / w_c.mean()
-        m_cost = RandomForestClassifier(n_estimators=120, max_depth=3, min_samples_split=8, max_features='sqrt', random_state=42, n_jobs=1).fit(c_sub[staples_features], c_sub['Target'].astype(int), sample_weight=w_c)
-        suite = {'lgb': m_lgb, 'rf': m_rf, 'semi_rf': m_semi, 'googl_rf': m_googl, 'cost_rf': m_cost, 'priors': {}}
+        Xc, yc = c_sub[staples_features].fillna(0.0), c_sub['Target'].astype(int)
+        m_cost = RandomForestClassifier(n_estimators=120, max_depth=3, min_samples_split=8, max_features='sqrt', random_state=42, n_jobs=1).fit(Xc, yc, sample_weight=w_c)
+        m_cost_et = ExtraTreesClassifier(n_estimators=150, max_depth=4, min_samples_split=8, max_features='sqrt', random_state=42, n_jobs=1).fit(Xc, yc, sample_weight=w_c)
+        m_cost_lr = make_pipeline(StandardScaler(), LogisticRegression(C=0.05, max_iter=500)).fit(Xc, yc, logisticregression__sample_weight=w_c)
+
+        suite = {
+            'lgb': m_lgb, 'rf': m_rf, 'et': m_et, 'lr': m_lr,
+            'semi_rf': m_semi, 'semi_et': m_semi_et, 'semi_lr': m_semi_lr,
+            'googl_rf': m_googl, 'googl_et': m_googl_et, 'googl_lr': m_googl_lr,
+            'cost_rf': m_cost, 'cost_et': m_cost_et, 'cost_lr': m_cost_lr,
+            'cols': {'feature_cols': feature_cols, 'semi_features': semi_features, 'staples_features': staples_features},
+            'priors': {}
+        }
         for t in TARGET_TICKERS:
             t_rows = sub_tr[sub_tr['Ticker'] == t]
             if not t_rows.empty:
@@ -1003,23 +991,14 @@ def run_models_and_inference():
         return _calibrate_prob(raw_p, pi0, alpha)
 
     chal_val_suite = _fit_suite_on(val_tr)
-    prod_priors = {}
-    for t in TARGET_TICKERS:
-        t_rows = train_df[train_df['Ticker'] == t]
-        if not t_rows.empty:
-            w_t = np.exp(-decay_rate * (max_train_date - pd.to_datetime(t_rows['Date'])).dt.days)
-            tmp_s = {'lgb': lgb, 'rf': rf, 'semi_rf': semi_rf, 'googl_rf': googl_rf, 'cost_rf': cost_rf}
-            prod_priors[t] = float(np.average(_raw_pred(tmp_s, t_rows, t), weights=w_t))
-        else:
-            prod_priors[t] = 0.45
-    chal_prod_suite = {'lgb': lgb, 'rf': rf, 'semi_rf': semi_rf, 'googl_rf': googl_rf, 'cost_rf': cost_rf, 'priors': prod_priors}
+    chal_prod_suite = _fit_suite_on(train_df)
 
     spec_names = {
         'NVDA': 'NVDA 60/40 Ensemble Specialist',
-        'TSLA': 'TSLA Tuned RF Specialist',
-        'AMD': 'AMD Semi-RF Specialist',
-        'COST': 'COST Staples-RF Specialist',
-        'GOOGL': 'GOOGL Mega-Cap AI Specialist'
+        'TSLA': 'TSLA Hybrid Tree+Linear Specialist',
+        'AMD': 'AMD Hybrid Semi Tree+Linear Specialist',
+        'COST': 'COST Hybrid Staples Tree+Linear Specialist',
+        'GOOGL': 'GOOGL Hybrid AI Tree+Linear Specialist'
     }
 
     if champion_registry is None:
@@ -1045,7 +1024,8 @@ def run_models_and_inference():
         else:
             score_champ = -1.0
 
-        if score_chal > score_champ + 1e-6:
+        # Strict Champion-vs-Challenger Gate: require AUC >= 0.52 and meaningful beat (> +0.002)
+        if (score_champ < 0) or (auc_chal >= 0.52 and score_chal > score_champ + 0.002):
             champion_registry['tickers'][tkr] = {
                 'model_name': spec_names.get(tkr, f"{tkr} Specialist"),
                 'cutoff_date': latest_cutoff_str,
@@ -1079,12 +1059,22 @@ def run_models_and_inference():
 
     # 6. Sync & Grade SQLite predictions_log and get Rolling 20-Day Specialist Win Rates
     rolling_win_rates = sync_and_grade_predictions_log(
-        train_df, feature_cols, semi_features, staples_features, decay_rate
+        train_df, base_feature_cols, base_semi_features, base_staples_features, decay_rate
     )
 
     # Generate today's inference on the latest available bar for each stock
     inferences = []
     latest_date = df['Date'].max()
+
+    # High-VIX Regime Throttle (VIX > 25 raises entry threshold 55%->57% and applies 0.75x size throttle)
+    latest_vix = float(df.sort_values('Date').iloc[-1].get('VIX_Close', 18.0))
+    vix_throttle = 0.75 if latest_vix > 25.0 else 1.0
+    long_thresh = 0.57 if latest_vix > 25.0 else 0.55
+    short_thresh = 0.43 if latest_vix > 25.0 else 0.45
+
+    # 20-day return correlation matrix for Correlation-Aware Portfolio Sizing
+    ret_pivot_20 = df.pivot(index='Date', columns='Ticker', values='Daily_Return').tail(20)
+    corr_mat_20 = ret_pivot_20.corr().fillna(0.0)
 
     for ticker in TARGET_TICKERS:
         t_sub = df[df['Ticker'] == ticker].sort_values('Date')
@@ -1095,19 +1085,10 @@ def run_models_and_inference():
         champ_info = champion_registry.get('tickers', {}).get(ticker) if champion_registry else None
         active_suite = champ_info.get('prod_suite') if champ_info else chal_prod_suite
         champ_cutoff = champ_info.get('cutoff_date', 'live') if champ_info else 'live'
+        champ_label = champ_info.get('model_name', f"{ticker} Champion") if champ_info else f"{ticker} Champion"
 
         final_prob = float(_pred_suite(active_suite, latest_row, ticker)[0])
-
-        if ticker == 'AMD':
-            model_used = f"AMD Semi-RF Champion ({champ_cutoff})"
-        elif ticker == 'GOOGL':
-            model_used = f"GOOGL Mega-Cap AI Champion ({champ_cutoff})"
-        elif ticker == 'COST':
-            model_used = f"COST Staples-RF Champion ({champ_cutoff})"
-        elif ticker == 'TSLA':
-            model_used = f"TSLA Tuned RF Champion ({champ_cutoff})"
-        else:
-            model_used = f"NVDA 60/40 Ens Champion ({champ_cutoff})"
+        model_used = f"{champ_label} ({champ_cutoff})"
 
         conviction = max(final_prob, 1.0 - final_prob)
         vol_10d = float(np.clip(latest_row['Vol_10d'].fillna(0.02).values[0], 0.008, 0.060))
@@ -1117,13 +1098,13 @@ def run_models_and_inference():
         stop_loss_pct = round(float(np.clip(vol_10d * 100.0 * 0.85, 1.0, 2.5)), 2)
 
         # Decision rule & conviction tier tailored specifically for 9:30 - 9:45 AM EST execution
-        if final_prob >= 0.55:
+        if final_prob >= long_thresh:
             action = "BUY / LONG"
             color = "#10b981"
             badge = "🟢 LONG (9:30-9:45)"
             bias = "📈 Bullish Rally"
             plan = f"Enter Long at open; hard stop -{stop_loss_pct:.2f}%"
-        elif final_prob <= 0.45:
+        elif final_prob <= short_thresh:
             action = "SHORT / FADE"
             color = "#ef4444"
             badge = "🔴 SHORT (9:30-9:45)"
@@ -1136,11 +1117,11 @@ def run_models_and_inference():
             bias = "⚖️ Neutral Chop"
             plan = "No statistical edge; preserve capital, wait on sidelines"
 
-        # Volatility-Adjusted Fractional Kelly Sizing + Bandit 20D Win-Rate Multiplier
+        # Volatility-Adjusted Fractional Kelly Sizing + Bandit 20D Win-Rate Multiplier + VIX Regime Throttle
         if action != "HOLD / PASS":
             edge = abs(final_prob - 0.50) * 2.0
             regime_mult = float(np.clip(win_20d / 0.55, 0.60, 1.35))
-            raw_kelly_pct = (edge / vol_10d) * 0.90 * regime_mult
+            raw_kelly_pct = (edge / vol_10d) * 0.90 * regime_mult * vix_throttle
             raw_alloc = float(np.clip(raw_kelly_pct, 5.0, 30.0))
         else:
             raw_alloc = 0.0
@@ -1170,6 +1151,20 @@ def run_models_and_inference():
             'RSI_14': float(latest_row['RSI_14'].values[0]),
             'Return_5d': float(latest_row['Return_5d'].values[0] * 100)
         })
+
+    # Correlation-Aware Portfolio Sizing: scale down correlated same-direction bets (e.g. NVDA + AMD)
+    for inf in inferences:
+        if inf['Raw_Alloc'] <= 0.0:
+            continue
+        t_i, act_i = inf['Ticker'], inf['Action']
+        pos_corr_sum = 0.0
+        for other in inferences:
+            t_j = other['Ticker']
+            if t_j != t_i and other['Raw_Alloc'] > 0.0 and other['Action'] == act_i:
+                if t_i in corr_mat_20.index and t_j in corr_mat_20.columns:
+                    pos_corr_sum += max(0.0, float(corr_mat_20.loc[t_i, t_j]))
+        corr_penalty = 1.0 / np.sqrt(1.0 + pos_corr_sum)
+        inf['Raw_Alloc'] = float(np.clip(inf['Raw_Alloc'] * corr_penalty, 5.0, 30.0))
 
     # Normalize portfolio weights so total capital deployed <= 100.0% (max 30% per single asset)
     total_raw_alloc = sum(inf['Raw_Alloc'] for inf in inferences)

@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-11-20",
+  "updated_at": "2026-11-21",
   "tickers": {
     "NVDA": {
       "model_name": "NVDA 60/40 Ensemble Specialist",
@@ -10,12 +10,12 @@
       "composite_score": 0.5434
     },
     "TSLA": {
-      "model_name": "TSLA Tuned RF Specialist",
-      "cutoff_date": "2026-11-03",
-      "promoted_at": "2026-11-04",
-      "oos_acc": 0.6441,
-      "oos_auc": 0.7319,
-      "composite_score": 0.6704
+      "model_name": "TSLA Hybrid Tree+Linear Specialist",
+      "cutoff_date": "2026-11-19",
+      "promoted_at": "2026-11-21",
+      "oos_acc": 0.661,
+      "oos_auc": 0.7098,
+      "composite_score": 0.6756
     },
     "AMD": {
       "model_name": "AMD Semi-RF Specialist",
