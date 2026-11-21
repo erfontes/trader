@@ -6,40 +6,40 @@
       "cutoff_date": "2026-11-19",
       "promoted_at": "2026-11-20",
       "oos_acc": 0.569,
-      "oos_auc": 0.4811,
-      "composite_score": 0.5426
+      "oos_auc": 0.4836,
+      "composite_score": 0.5434
     },
     "TSLA": {
       "model_name": "TSLA Tuned RF Specialist",
       "cutoff_date": "2026-11-03",
       "promoted_at": "2026-11-04",
       "oos_acc": 0.6441,
-      "oos_auc": 0.7331,
-      "composite_score": 0.6708
+      "oos_auc": 0.7319,
+      "composite_score": 0.6704
     },
     "AMD": {
       "model_name": "AMD Semi-RF Specialist",
       "cutoff_date": "2026-10-29",
       "promoted_at": "2026-10-30",
       "oos_acc": 0.5517,
-      "oos_auc": 0.5803,
-      "composite_score": 0.5603
+      "oos_auc": 0.5755,
+      "composite_score": 0.5589
     },
     "COST": {
       "model_name": "COST Staples-RF Specialist",
       "cutoff_date": "2026-10-29",
       "promoted_at": "2026-10-30",
-      "oos_acc": 0.6207,
-      "oos_auc": 0.5723,
-      "composite_score": 0.6062
+      "oos_acc": 0.6034,
+      "oos_auc": 0.577,
+      "composite_score": 0.5955
     },
     "GOOGL": {
       "model_name": "GOOGL Mega-Cap AI Specialist",
       "cutoff_date": "2026-11-13",
       "promoted_at": "2026-11-16",
-      "oos_acc": 0.6207,
-      "oos_auc": 0.5857,
-      "composite_score": 0.6102
+      "oos_acc": 0.6034,
+      "oos_auc": 0.5544,
+      "composite_score": 0.5887
     }
   }
 }
