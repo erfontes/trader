@@ -61,6 +61,28 @@ MAX_HISTORY_CHARS = 8000
 # Cache the most recent web/URL/PDF context so follow-up questions remember details
 LAST_WEB_CONTEXT = {"context": "", "sources": [], "timestamp": 0.0}
 
+SEARCH_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "search_config.json")
+
+
+def load_search_config() -> dict:
+    """Load Serper / Tavily API keys from search_config.json or environment variables (live-reloaded)."""
+    cfg = {
+        "serper_api_key": os.getenv("SERPER_API_KEY", "").strip(),
+        "tavily_api_key": os.getenv("TAVILY_API_KEY", "").strip(),
+    }
+    try:
+        if os.path.exists(SEARCH_CONFIG_PATH):
+            with open(SEARCH_CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                if data.get("serper_api_key"):
+                    cfg["serper_api_key"] = str(data["serper_api_key"]).strip()
+                if data.get("tavily_api_key"):
+                    cfg["tavily_api_key"] = str(data["tavily_api_key"]).strip()
+    except Exception as e:
+        print(f"[Search Config Warning] Could not read {SEARCH_CONFIG_PATH}: {e}")
+    return cfg
+
 USER_AGENT = (
     "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -199,17 +221,170 @@ def search_duckduckgo(query: str, max_results: int = 4, is_recent: bool = False)
     return results
 
 
+def search_serper(query: str, api_key: str, max_results: int = 6) -> list:
+    """Real Google Web Search via Serper.dev API (returns Answer Box, Knowledge Graph & organic results)."""
+    results = []
+    try:
+        resp = requests.post(
+            "https://google.serper.dev/search",
+            headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+            json={"q": query, "gl": "us", "hl": "en", "num": max(max_results, 6)},
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            # 1. Google Answer Box / Featured Snippet (if present)
+            ab = data.get("answerBox") or {}
+            if ab:
+                ab_title = ab.get("title") or "Google Featured Answer"
+                ab_snip = " | ".join(
+                    str(v) for v in [ab.get("answer"), ab.get("snippet")] if v
+                )
+                if ab_snip:
+                    results.append({
+                        "title": ab_title,
+                        "url": ab.get("link") or "https://www.google.com",
+                        "snippet": ab_snip[:500],
+                        "engine": "serper",
+                    })
+            # 2. Knowledge Graph (if present)
+            kg = data.get("knowledgeGraph") or {}
+            if kg and kg.get("description"):
+                kg_attrs = kg.get("attributes") or {}
+                attr_str = " · ".join(f"{k}: {v}" for k, v in list(kg_attrs.items())[:5])
+                results.append({
+                    "title": kg.get("title") or query,
+                    "url": kg.get("website") or kg.get("descriptionLink") or "https://www.google.com",
+                    "snippet": f"{kg.get('description', '')} {attr_str}".strip()[:500],
+                    "engine": "serper",
+                })
+            # 3. Organic Google Web Results
+            for item in data.get("organic", []):
+                title = (item.get("title") or "").strip()
+                link = (item.get("link") or "").strip()
+                snippet = (item.get("snippet") or "").strip()
+                date_str = (item.get("date") or "").strip()
+                if date_str:
+                    snippet = f"[{date_str}] {snippet}"
+                if title and link:
+                    results.append({
+                        "title": title,
+                        "url": link,
+                        "snippet": snippet[:500],
+                        "engine": "serper",
+                    })
+                if len(results) >= max_results:
+                    break
+        else:
+            print(f"[Search Warning] Serper HTTP {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[Search Warning] Serper error: {e}")
+    return results[:max_results]
+
+
+def search_tavily(query: str, api_key: str, max_results: int = 6) -> list:
+    """AI-optimized general web search via Tavily API (1,000 free searches/mo)."""
+    results = []
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": api_key,
+                "query": query,
+                "search_depth": "basic",
+                "include_answer": True,
+                "max_results": max_results,
+            },
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("answer"):
+                results.append({
+                    "title": "Tavily Live Web Summary",
+                    "url": (data.get("results") or [{}])[0].get("url", "https://tavily.com"),
+                    "snippet": str(data["answer"])[:600],
+                    "engine": "tavily",
+                })
+            for item in data.get("results", []):
+                title = (item.get("title") or "").strip()
+                url = (item.get("url") or "").strip()
+                content = (item.get("content") or "").strip()
+                if title and url:
+                    results.append({
+                        "title": title,
+                        "url": url,
+                        "snippet": content[:500],
+                        "engine": "tavily",
+                    })
+                if len(results) >= max_results:
+                    break
+        else:
+            print(f"[Search Warning] Tavily HTTP {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[Search Warning] Tavily error: {e}")
+    return results[:max_results]
+
+
+def search_ddg_lite(query: str, max_results: int = 4) -> list:
+    """Lightweight DuckDuckGo Lite GET fallback when HTML POST is rate-limited."""
+    results = []
+    try:
+        resp = requests.get(
+            "https://lite.duckduckgo.com/lite/",
+            params={"q": query},
+            headers={"User-Agent": DESKTOP_UA, "Accept-Language": "en-US,en;q=0.9"},
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            links = soup.select("a.result-link")
+            snippets = soup.select("td.result-snippet")
+            for idx, a_tag in enumerate(links):
+                title = a_tag.get_text(" ", strip=True)
+                url = unwrap_ddg_url(a_tag.get("href", ""))
+                snip = snippets[idx].get_text(" ", strip=True) if idx < len(snippets) else ""
+                if url and url.startswith("http") and "duckduckgo.com/y.js" not in url:
+                    results.append({
+                        "title": title,
+                        "url": url,
+                        "snippet": snip,
+                        "engine": "ddg-lite",
+                    })
+                if len(results) >= max_results:
+                    break
+    except Exception as e:
+        print(f"[Search Warning] DDG Lite error: {e}")
+    return results
+
+
 def search_web(query: str, max_results: int = 6) -> list:
     """
-    Hybrid Search Engine: Combines Google Live Search (news.google.com/rss) +
-    DuckDuckGo Web Search with smart date/recency prioritization.
+    Smart Multi-Provider Web Search:
+      1. Serper.dev (Google Web Search API) if configured
+      2. Tavily Search API if configured
+      3. Free Hybrid Fallback: DuckDuckGo (HTML + Lite) + Google News RSS
     """
+    cfg = load_search_config()
+
+    if cfg.get("serper_api_key"):
+        hits = search_serper(query, cfg["serper_api_key"], max_results=max_results)
+        if hits:
+            return hits
+
+    if cfg.get("tavily_api_key"):
+        hits = search_tavily(query, cfg["tavily_api_key"], max_results=max_results)
+        if hits:
+            return hits
+
     is_recent = bool(RECENCY_QUERY_PATTERNS.search(query))
     google_hits = search_google_live(query, max_results=4 if is_recent else 2, is_recent=is_recent)
     ddg_hits = search_duckduckgo(query, max_results=4, is_recent=is_recent)
 
     if is_recent and not ddg_hits:
         ddg_hits = search_duckduckgo(query, max_results=4, is_recent=False)
+    if not ddg_hits:
+        ddg_hits = search_ddg_lite(query, max_results=4)
 
     if is_recent:
         combined = google_hits + ddg_hits
@@ -1846,6 +2021,101 @@ def should_auto_search(user_text: str, has_history: bool = False) -> bool:
     return False
 
 
+def smart_route_and_rewrite(
+    raw_messages: list,
+    force_search: bool = False,
+) -> tuple:
+    """
+    Smart Agent Router (~0.25s on Gemma 4 31B MTP):
+    Uses the local LLM with a tiny 32-token response to decide whether live web
+    search is needed AND rewrite conversational/typo-ridden prompts into a clean,
+    optimal search query (e.g. 'any sales on aberecrombiee and fistch?' ->
+    'Abercrombie & Fitch current sales deals November 2026').
+
+    Returns: (should_search: bool, clean_query: str)
+    """
+    last_user_msg = (raw_messages[-1].get("content") or "").strip()
+    if not last_user_msg:
+        return False, ""
+
+    month_year = time.strftime("%B %Y")
+    today_str = time.strftime("%B %d, %Y")
+
+    # Include brief recent user context (last 2 turns) so follow-ups resolve pronouns cleanly
+    recent_ctx_lines = []
+    for m in raw_messages[-4:-1]:
+        role = m.get("role", "user")
+        txt = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", m.get("content") or "", flags=re.I).strip()
+        if txt:
+            recent_ctx_lines.append(f"{role.capitalize()}: {txt[:180]}")
+    ctx_block = "\n".join(recent_ctx_lines)
+
+    if force_search:
+        router_prompt = (
+            f"Today is {today_str}.\n"
+            f"Rewrite the user's message into a single clean, typo-corrected web search query (under 14 words). "
+            f"Fix any misspellings (brand names, street names, people). Add '{month_year}' if asking about current deals, prices, news, or live info.\n"
+            f"Reply with ONLY: SEARCH: <query>\n\n"
+            + (f"Recent conversation:\n{ctx_block}\n\n" if ctx_block else "")
+            + f"User message: {last_user_msg[:300]}"
+        )
+    else:
+        router_prompt = (
+            f"Today is {today_str}.\n"
+            f"You are a fast search router for a personal AI assistant.\n"
+            f"Decide if the user's message requires LIVE WEB SEARCH (current sales/deals/coupons, home/property values, prices, stocks, weather, sports scores, news, local stores/hours, recent events, specific real-world facts/people you might not know).\n"
+            f"If it can be answered purely from general knowledge, math, coding, writing, translation, or brainstorming, reply with ONLY:\n"
+            f"NO_SEARCH\n"
+            f"If it needs web search, fix ALL typos/misspellings and reply with ONLY one line:\n"
+            f"SEARCH: <clean concise search query, include '{month_year}' for current/live topics>\n\n"
+            + (f"Recent conversation:\n{ctx_block}\n\n" if ctx_block else "")
+            + f"User message: {last_user_msg[:300]}"
+        )
+
+    try:
+        t_r = time.time()
+        r = requests.post(
+            f"{GEMMA_API_BASE}/v1/chat/completions",
+            json={
+                "model": "gemma4:31b",
+                "messages": [{"role": "user", "content": router_prompt}],
+                "temperature": 0.0,
+                "max_tokens": 40,
+                "stream": False,
+            },
+            timeout=8,
+        )
+        if r.status_code == 200:
+            raw_out = (
+                r.json().get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            # Strip any accidental <think> block or markdown
+            clean_out = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", raw_out, flags=re.I).strip()
+            first_line = clean_out.splitlines()[0].strip() if clean_out else ""
+            dt = time.time() - t_r
+            print(f"[SmartRouter] ({dt:.2f}s) -> {first_line}")
+
+            if first_line.upper().startswith("NO_SEARCH") and not force_search:
+                return False, ""
+            if first_line.upper().startswith("SEARCH:"):
+                q = first_line[7:].strip().strip('"').strip("'")
+                if q:
+                    return True, q[:160]
+            if force_search and first_line and not first_line.upper().startswith("NO_SEARCH"):
+                return True, first_line.strip('"').strip("'")[:160]
+    except Exception as e:
+        print(f"[SmartRouter Warning] Fallback to regex router: {e}")
+
+    # Safe fallback if router call failed
+    if force_search or should_auto_search(last_user_msg, has_history=len(raw_messages) > 1):
+        fallback_q = re.sub(r"^(search( the web)?( for)?|look up|tell me about)\s+", "", last_user_msg, flags=re.I)
+        return True, fallback_q[:160]
+    return False, ""
+
+
 def build_augmented_messages(
     raw_messages: list,
     search_mode: str,
@@ -1854,7 +2124,7 @@ def build_augmented_messages(
     documents: list = None,
 ):
     if not raw_messages:
-        return [], []
+        return [], [], ""
 
     images = images or []
     documents = documents or []
@@ -1864,6 +2134,7 @@ def build_augmented_messages(
     urls = extract_urls(last_user_msg)
     sources = []
     context_blocks = []
+    search_engine_used = ""
 
     # 0. Uploaded PDF / Text Documents
     for doc in documents[:3]:
@@ -1896,28 +2167,26 @@ def build_augmented_messages(
                 f"[Related Search Result: {h['title']} ({h['url']})]\nSnippet: {h['snippet']}"
             )
 
-    # 2. Live Web Search
+    # 2. Smart Agent Router + Live Web Search
     has_history = len(raw_messages) > 1
-    do_search = not urls and (
-        search_mode in ("search", "deep")
-        or (search_mode == "auto" and not has_attachments and should_auto_search(last_user_msg, has_history=has_history))
-    )
+    do_search = False
+    query = ""
 
-    if do_search:
-        raw_q = last_user_msg.strip()
-        if has_history and len(raw_q.split()) <= 6:
-            prev_user = next((m["content"] for m in reversed(raw_messages[:-1]) if m.get("role") == "user"), "")
-            if prev_user:
-                raw_q = f"{prev_user[:80]} {raw_q}"
-        query = re.sub(r"^(search( the web)?( for)?|look up|tell me about)\s+", "", raw_q, flags=re.I)
-        query = query[:160]
+    if not urls and search_mode in ("search", "deep"):
+        do_search, query = smart_route_and_rewrite(raw_messages, force_search=True)
+    elif not urls and search_mode == "auto" and not has_attachments and not is_coding_request(last_user_msg, search_mode):
+        do_search, query = smart_route_and_rewrite(raw_messages, force_search=False)
+
+    if do_search and query:
         hits = search_web(query, max_results=6)
+        if hits:
+            search_engine_used = hits[0].get("engine", "web")
         scraped_count = 0
         max_scrapes = 2 if search_mode == "deep" else 1
         for idx, h in enumerate(hits, 1):
             sources.append({"title": h["title"], "url": h["url"]})
             block = f"[{idx}] {h['title']}\nURL: {h['url']}\nSnippet: {h['snippet']}"
-            if scraped_count < max_scrapes and "news.google.com" not in h["url"]:
+            if scraped_count < max_scrapes and "news.google.com" not in h["url"] and h.get("engine") != "tavily":
                 page = fetch_page_text(h["url"], max_chars=1800, use_jina_fallback=False)
                 if page.get("text"):
                     block += f"\nExtracted Page Content: {page['text']}"
@@ -1990,7 +2259,7 @@ def build_augmented_messages(
         user_msg_dict["images"] = images
 
     final_messages = trimmed_history + [user_msg_dict]
-    return final_messages, sources
+    return final_messages, sources, search_engine_used
 
 
 # ==============================================================================
@@ -2089,7 +2358,7 @@ class MobileUIHandler(BaseHTTPRequestHandler):
                 documents = req_data.get("documents") or []
 
                 t0 = time.time()
-                final_messages, sources = build_augmented_messages(
+                final_messages, sources, search_engine_used = build_augmented_messages(
                     raw_messages,
                     search_mode,
                     think_mode=think_mode,
@@ -2126,7 +2395,8 @@ class MobileUIHandler(BaseHTTPRequestHandler):
 
                 stats_parts = []
                 if sources:
-                    stats_parts.append(f"{len(sources)} web sources ({search_elapsed:.1f}s)")
+                    eng_label = f" via {search_engine_used.title()}" if search_engine_used else ""
+                    stats_parts.append(f"{len(sources)} web sources{eng_label} ({search_elapsed:.1f}s)")
                 if comp_tokens:
                     stats_parts.append(f"{comp_tokens} tok in {llm_elapsed:.1f}s ({tok_s:.1f} tok/s)")
 
