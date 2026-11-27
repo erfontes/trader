@@ -810,6 +810,38 @@ def sync_and_grade_predictions_log(train_df, feature_cols, semi_features, staple
     return rolling_win_rates
 
 
+def get_upcoming_earnings_map(tickers, lookahead_days=2):
+    """
+    Safely checks yfinance for upcoming earnings dates within [0, lookahead_days] calendar days.
+    Always fails soft (returns {}) if offline or Yahoo blocks calendar lookup.
+    """
+    alerts = {}
+    today_d = date.today()
+    for tkr in tickers:
+        try:
+            cal = yf.Ticker(tkr).calendar
+            e_dates = []
+            if isinstance(cal, dict):
+                raw_ed = cal.get('Earnings Date', [])
+                if not isinstance(raw_ed, (list, tuple)):
+                    raw_ed = [raw_ed]
+                for d in raw_ed:
+                    if d is not None:
+                        e_dates.append(pd.to_datetime(d).date())
+            elif hasattr(cal, 'loc') and 'Earnings Date' in getattr(cal, 'index', []):
+                for d in cal.loc['Earnings Date']:
+                    if pd.notna(d):
+                        e_dates.append(pd.to_datetime(d).date())
+            for ed in e_dates:
+                delta = (ed - today_d).days
+                if 0 <= delta <= lookahead_days:
+                    alerts[tkr] = (ed.strftime('%Y-%m-%d'), delta)
+                    break
+        except Exception:
+            continue
+    return alerts
+
+
 def run_models_and_inference():
     print("⚙️ Step 4: Engineering 44 Alpha Signals & Generating Pre-Market Inferences...")
     df = build_feature_dataset()
@@ -1076,6 +1108,10 @@ def run_models_and_inference():
     ret_pivot_20 = df.pivot(index='Date', columns='Ticker', values='Daily_Return').tail(20)
     corr_mat_20 = ret_pivot_20.corr().fillna(0.0)
 
+    # Safe Earnings Blackout Check (flags binary earnings within 0-2 days) & Optional Vanguard Long-Only Mode
+    earnings_map = get_upcoming_earnings_map(TARGET_TICKERS, lookahead_days=2)
+    long_only_mode = os.getenv("LONG_ONLY_MODE", "false").strip().lower() in ("1", "true", "yes")
+
     for ticker in TARGET_TICKERS:
         t_sub = df[df['Ticker'] == ticker].sort_values('Date')
         if t_sub.empty:
@@ -1093,9 +1129,14 @@ def run_models_and_inference():
         conviction = max(final_prob, 1.0 - final_prob)
         vol_10d = float(np.clip(latest_row['Vol_10d'].fillna(0.02).values[0], 0.008, 0.060))
         win_20d = rolling_win_rates.get(ticker, 0.60)
+        close_px = float(latest_row['Price'].values[0])
 
         # Volatility-Scaled Stop-Loss (0.85x 10D daily volatility, bounded between 1.0% and 2.5%)
         stop_loss_pct = round(float(np.clip(vol_10d * 100.0 * 0.85, 1.0, 2.5)), 2)
+
+        # Exact Vanguard execution reference prices (Max Limit Buy ceiling & Hard Stop $)
+        max_limit_buy = round(close_px * (1.0 + 0.75 * vol_10d), 2)
+        hard_stop_price = round(close_px * (1.0 - stop_loss_pct / 100.0), 2)
 
         # Decision rule & conviction tier tailored specifically for 9:30 - 9:45 AM EST execution
         if final_prob >= long_thresh:
@@ -1103,14 +1144,24 @@ def run_models_and_inference():
             color = "#10b981"
             badge = "🟢 LONG (9:30-9:45)"
             bias = "📈 Bullish Rally"
-            plan = f"Enter Long at open; hard stop -{stop_loss_pct:.2f}%"
+            plan = f"Limit Buy <= ${max_limit_buy:.2f}; Sell Stop @ ${hard_stop_price:.2f} (-{stop_loss_pct:.2f}%)"
         elif final_prob <= short_thresh:
-            action = "SHORT / FADE"
-            color = "#ef4444"
-            badge = "🔴 SHORT (9:30-9:45)"
-            bias = "📉 Bearish Drop"
-            plan = f"Fade open / Short; hard stop +{stop_loss_pct:.2f}%"
+            hard_stop_price = round(close_px * (1.0 + stop_loss_pct / 100.0), 2)
+            max_limit_buy = None
+            if long_only_mode:
+                action = "HOLD / PASS"
+                color = "#f59e0b"
+                badge = "⚠️ AVOID / TRIM"
+                bias = "📉 Bearish Drop (Long-Only: Cash)"
+                plan = "Bearish signal: avoid new buys; trim if held"
+            else:
+                action = "SHORT / FADE"
+                color = "#ef4444"
+                badge = "🔴 SHORT (9:30-9:45)"
+                bias = "📉 Bearish Drop"
+                plan = f"Fade open / Short; hard stop @ ${hard_stop_price:.2f} (+{stop_loss_pct:.2f}%)"
         else:
+            max_limit_buy = None
             action = "HOLD / PASS"
             color = "#6b7280"
             badge = "⚪ PASS (Chop)"
@@ -1126,12 +1177,21 @@ def run_models_and_inference():
         else:
             raw_alloc = 0.0
 
+        # Earnings Blackout Guardrail: halve size & display warning if earnings within 0-2 days
+        earnings_alert = ""
+        if ticker in earnings_map:
+            e_date, e_days = earnings_map[ticker]
+            earnings_alert = f"⚠️ EARNINGS ({e_date})"
+            if raw_alloc > 0.0:
+                raw_alloc = float(np.clip(raw_alloc * 0.50, 5.0, 15.0))
+                plan += f" | {earnings_alert}: 0.5x event-risk cap"
+
         high_conviction = conviction >= 0.60 or conviction <= 0.40
 
         inferences.append({
             'Ticker': ticker,
             'Date': latest_row['Date'].values[0],
-            'Price': float(latest_row['Price'].values[0]),
+            'Price': close_px,
             'Prob_Up': float(final_prob),
             'Conviction': float(conviction),
             'Action': action,
@@ -1144,6 +1204,9 @@ def run_models_and_inference():
             'Raw_Alloc': raw_alloc,
             'Alloc_Pct': raw_alloc,
             'Stop_Loss_Pct': stop_loss_pct,
+            'Max_Limit_Buy': max_limit_buy,
+            'Hard_Stop_Price': hard_stop_price,
+            'Earnings_Alert': earnings_alert,
             'Win_20d': win_20d,
             'Vol_10d': vol_10d * 100.0,
             'Sent_Intensity': float(latest_row['Avg_Intensity'].values[0]),
@@ -1273,12 +1336,18 @@ def generate_html_report(inferences, macro_info, gemma_narrative=None):
         prob_pct = inf['Prob_Up'] * 100
         alloc_pct = inf.get('Alloc_Pct', 0.0)
         stop_pct = inf.get('Stop_Loss_Pct', 1.5)
+        stop_px = inf.get('Hard_Stop_Price')
+        max_buy = inf.get('Max_Limit_Buy')
+        e_alert = inf.get('Earnings_Alert', '')
         win_20d = inf.get('Win_20d', 0.60) * 100
         star = " 🔥" if inf['High_Conviction'] else ""
+        e_html = f'<div style="color: #fbbf24; font-size: 11px; font-weight: 600; margin-top: 3px;">{e_alert}</div>' if e_alert else ""
+        max_buy_str = f"${max_buy:.2f}" if max_buy is not None else "—"
+        stop_str = f"${stop_px:.2f} <span style=\"color:#94a3b8;font-size:11px;\">({stop_pct:.2f}%)</span>" if stop_px is not None else f"-{stop_pct:.2f}%"
 
         rows_html += f"""
         <tr style="border-bottom: 1px solid #2d3748;">
-            <td style="padding: 12px 14px; font-weight: 700; font-size: 15px; color: #f8fafc;">{inf['Ticker']}{star}</td>
+            <td style="padding: 12px 14px; font-weight: 700; font-size: 15px; color: #f8fafc;">{inf['Ticker']}{star}{e_html}</td>
             <td style="padding: 12px 14px; text-align: center;">
                 <span style="background-color: {inf['Color']}22; color: {inf['Color']}; border: 1px solid {inf['Color']}; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 13px;">
                     {inf['Badge']}
@@ -1286,7 +1355,8 @@ def generate_html_report(inferences, macro_info, gemma_narrative=None):
             </td>
             <td style="padding: 12px 14px; font-weight: 700; color: #f8fafc; text-align: right;">{conv_pct:.1f}%</td>
             <td style="padding: 12px 14px; color: #38bdf8; font-weight: 700; text-align: right;">{alloc_pct:.1f}%</td>
-            <td style="padding: 12px 14px; color: #f59e0b; font-weight: 600; text-align: right;">-{stop_pct:.2f}%</td>
+            <td style="padding: 12px 14px; color: #10b981; font-weight: 600; text-align: right;">{max_buy_str}</td>
+            <td style="padding: 12px 14px; color: #f59e0b; font-weight: 600; text-align: right;">{stop_str}</td>
             <td style="padding: 12px 14px; color: #94a3b8; text-align: right;">{prob_pct:.1f}%</td>
             <td style="padding: 12px 14px; color: #f8fafc; text-align: right;">${inf['Price']:.2f}</td>
             <td style="padding: 12px 14px; color: {'#10b981' if inf['Return_5d'] >= 0 else '#ef4444'}; text-align: right;">{inf['Return_5d']:+.1f}%</td>
@@ -1351,7 +1421,8 @@ def generate_html_report(inferences, macro_info, gemma_narrative=None):
                                 <th style="padding: 10px 14px; text-align: center;">Signal (9:30-9:45)</th>
                                 <th style="padding: 10px 14px; text-align: right;">Conviction</th>
                                 <th style="padding: 10px 14px; text-align: right;">Size (% Cap)</th>
-                                <th style="padding: 10px 14px; text-align: right;">Vol Stop</th>
+                                <th style="padding: 10px 14px; text-align: right;">Max Buy $</th>
+                                <th style="padding: 10px 14px; text-align: right;">Hard Stop $</th>
                                 <th style="padding: 10px 14px; text-align: right;">P(Up)</th>
                                 <th style="padding: 10px 14px; text-align: right;">Close</th>
                                 <th style="padding: 10px 14px; text-align: right;">5D Ret</th>
