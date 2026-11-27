@@ -20,12 +20,16 @@ import json
 import time
 import signal
 import smtplib
+import sqlite3
+import imaplib
+import email
+from email.header import decode_header
 import argparse
 import subprocess
 from datetime import datetime, date
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 import requests
 from bs4 import BeautifulSoup
@@ -205,15 +209,316 @@ def execute_searches(
 
 
 # ==============================================================================
-# 4B. Direct Lowes Foods Weekly Ad Product Extractor (Flipp Digital Circular API)
+# 4B. Direct Lowes Foods Weekly Ad + Gmail Receipt Habit Analyzer
 # ==============================================================================
 LOWES_FLIPP_TOKEN = "07da9af5b839c91b8ebca4cee1c162e4"
+GROCERY_DB_PATH = os.path.join(BASE_DIR, "grocery_habits.db")
+
+STOPWORDS = {
+    "LOWES", "FOODS", "LFS", "ORGANIC", "FRESH", "ALL", "NATURAL", "SELECTED",
+    "THE", "AND", "OR", "IN", "WITH", "OF", "OZ", "LB", "PK", "CT", "EA", "BOTT",
+    "CAN", "CANS", "PACK", "2PK", "4PK", "6PK", "12PK", "4P", "1LB", "100%", "2%",
+    "0.0%", "LITER", "LI", "MUL", "C", "H", "S", "FP", "HH", "SW", "W/BUN"
+}
 
 
-def fetch_lowes_foods_circular(postal_code: str = "27601", store_code: str = "185") -> Dict[str, Any]:
+def init_grocery_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(GROCERY_DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS receipts (
+            msg_id TEXT PRIMARY KEY,
+            receipt_date TEXT,
+            store_number TEXT,
+            subtotal REAL,
+            savings REAL,
+            total REAL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS receipt_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            msg_id TEXT,
+            receipt_date TEXT,
+            product_id TEXT,
+            item_name TEXT,
+            qty REAL,
+            unit_price REAL,
+            line_total REAL,
+            UNIQUE(msg_id, product_id, item_name)
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def parse_lowes_receipt_text(text: str) -> Dict[str, Any]:
+    """Parses both Concord (modern multi-line) and Waxhaw (compact) Lowes Foods email receipts."""
+    store_num = "0282"
+    receipt_date = date.today().isoformat()
+
+    # Format A: 11/21/2026 13:55 PM Store: 0282
+    m_date = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4})\s+\d{1,2}:\d{2}(?:\s*[AP]M)?\s+Store:\s*(\d+)", text)
+    if m_date:
+        raw_dt, store_num = m_date.group(1), m_date.group(2)
+        for fmt in ("%m/%d/%Y", "%m/%d/%y"):
+            try:
+                receipt_date = datetime.strptime(raw_dt, fmt).date().isoformat()
+                break
+            except ValueError:
+                pass
+    else:
+        # Format B: 11/22/26 13:04 0291 ... Store #291
+        m_date_b = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4})\s+\d{1,2}:\d{2}\s+(\d{4})", text)
+        if m_date_b:
+            raw_dt, store_num = m_date_b.group(1), m_date_b.group(2)
+            for fmt in ("%m/%d/%y", "%m/%d/%Y"):
+                try:
+                    receipt_date = datetime.strptime(raw_dt, fmt).date().isoformat()
+                    break
+                except ValueError:
+                    pass
+
+    items = []
+    # Match Format A item blocks:
+    # ITEM NAME 21.98
+    # Product ID: 7289000621
+    # 2 @ 10.99
+    pattern_a = re.compile(
+        r"------------------------------\s*\r?\n"
+        r"([A-Z0-9\'\-%\.\/&\s]+?)\s+(\d+\.\d{2})\s*\r?\n"
+        r"Product ID:\s*(\d+)\s*\r?\n"
+        r"([\d\.]+)\s*@\s*(\d+\.\d{2})",
+        re.MULTILINE,
+    )
+    for m in pattern_a.finditer(text):
+        name = m.group(1).strip()
+        line_total = float(m.group(2))
+        pid = m.group(3).strip()
+        qty = float(m.group(4))
+        unit_price = float(m.group(5))
+        items.append({
+            "product_id": pid,
+            "item_name": name,
+            "qty": qty,
+            "unit_price": unit_price,
+            "line_total": line_total,
+        })
+
+    # Match Format B compact lines (e.g., CARD #XXXXXXX8698   5" ORCHID CERAMI   19.99 T)
+    if not items:
+        pattern_b = re.compile(r"CARD\s+#[X\d]+\s+([A-Z0-9\"\'\-\s]+?)\s+(\d+\.\d{2})\s+[TF]", re.IGNORECASE)
+        for m in pattern_b.finditer(text):
+            name = m.group(1).strip()
+            price = float(m.group(2))
+            items.append({
+                "product_id": "UNKNOWN",
+                "item_name": name,
+                "qty": 1.0,
+                "unit_price": price,
+                "line_total": price,
+            })
+
+    def extract_money(label: str) -> float:
+        m = re.search(rf"(?:^|\n)\s*{label}\s+(-?\d+\.\d{{2}})", text, re.IGNORECASE)
+        return float(m.group(1)) if m else 0.0
+
+    subtotal = extract_money("Subtotal")
+    savings = abs(extract_money("Savings"))
+    total = extract_money("Total") or extract_money("BALANCE")
+
+    return {
+        "receipt_date": receipt_date,
+        "store_number": store_num,
+        "subtotal": subtotal,
+        "savings": savings,
+        "total": total,
+        "items": items,
+    }
+
+
+def sync_receipts_from_gmail() -> Dict[str, Any]:
+    """Connects to Gmail IMAP, parses any new Lowes Foods receipt emails, and updates grocery_habits.db."""
+    conn = init_grocery_db()
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_pass = os.getenv("SMTP_PASSWORD")
+    if not smtp_user or not smtp_pass:
+        print("⚠️ Gmail credentials not found in .env; skipping receipt sync.")
+        return get_household_habits(conn)
+
+    new_receipts = 0
+    new_items = 0
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail.login(smtp_user, smtp_pass)
+        mail.select('"[Gmail]/All Mail"')
+
+        status, data = mail.search(None, '(TEXT "Lowes Foods")')
+        msg_ids = data[0].split() if data and data[0] else []
+
+        for raw_id in msg_ids:
+            # Fetch header + Message-ID first to avoid re-downloading processed messages
+            status, hdr_data = mail.fetch(raw_id, "(BODY.PEEK[HEADER.FIELDS (SUBJECT MESSAGE-ID DATE)])")
+            if not hdr_data or not hdr_data[0]:
+                continue
+            hdr_msg = email.message_from_bytes(hdr_data[0][1])
+            subj = str(email.header.make_header(decode_header(hdr_msg.get("Subject", ""))))
+            if "receipt" not in subj.lower() or "lowes" not in subj.lower():
+                continue
+
+            unique_msg_id = (hdr_msg.get("Message-ID") or raw_id.decode()).strip()
+            exists = conn.execute("SELECT 1 FROM receipts WHERE msg_id = ?", (unique_msg_id,)).fetchone()
+            if exists:
+                continue
+
+            status, msg_data = mail.fetch(raw_id, "(RFC822)")
+            msg = email.message_from_bytes(msg_data[0][1])
+            plain_body = ""
+            for part in msg.walk():
+                if part.get_content_type() == "text/plain":
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        plain_body = payload.decode(errors="ignore")
+                        break
+            if not plain_body:
+                for part in msg.walk():
+                    if part.get_content_type() == "text/html":
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            soup = BeautifulSoup(payload.decode(errors="ignore"), "html.parser")
+                            plain_body = soup.get_text("\n", strip=True)
+                            break
+
+            parsed = parse_lowes_receipt_text(plain_body)
+            if not parsed["items"]:
+                continue
+
+            conn.execute(
+                "INSERT OR IGNORE INTO receipts (msg_id, receipt_date, store_number, subtotal, savings, total) VALUES (?, ?, ?, ?, ?, ?)",
+                (unique_msg_id, parsed["receipt_date"], parsed["store_number"], parsed["subtotal"], parsed["savings"], parsed["total"]),
+            )
+            new_receipts += 1
+            for it in parsed["items"]:
+                conn.execute(
+                    """INSERT OR IGNORE INTO receipt_items
+                       (msg_id, receipt_date, product_id, item_name, qty, unit_price, line_total)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (unique_msg_id, parsed["receipt_date"], it["product_id"], it["item_name"], it["qty"], it["unit_price"], it["line_total"]),
+                )
+                new_items += 1
+
+        conn.commit()
+        mail.logout()
+    except Exception as e:
+        print(f"⚠️ Gmail receipt sync warning: {e}")
+
+    habits = get_household_habits(conn)
+    habits["new_receipts_synced"] = new_receipts
+    habits["new_items_synced"] = new_items
+    conn.close()
+    return habits
+
+
+def get_household_habits(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Aggregates receipt history into ranked household staples and recent purchases."""
+    rows = conn.execute("""
+        SELECT
+            item_name,
+            product_id,
+            COUNT(DISTINCT msg_id) AS trip_count,
+            SUM(qty) AS total_qty,
+            ROUND(AVG(unit_price), 2) AS avg_unit_price,
+            ROUND(AVG(line_total / CASE WHEN qty > 0 THEN qty ELSE 1 END), 2) AS avg_paid_price,
+            MAX(receipt_date) AS last_bought
+        FROM receipt_items
+        GROUP BY item_name
+        ORDER BY trip_count DESC, total_qty DESC, last_bought DESC
+    """).fetchall()
+
+    receipt_summary = conn.execute("""
+        SELECT COUNT(*), COALESCE(SUM(total), 0), COALESCE(SUM(savings), 0), MAX(receipt_date)
+        FROM receipts
+    """).fetchone()
+
+    items = []
+    for r in rows:
+        items.append({
+            "item_name": r[0],
+            "product_id": r[1],
+            "trip_count": r[2],
+            "total_qty": r[3],
+            "avg_unit_price": r[4],
+            "avg_paid_price": r[5],
+            "last_bought": r[6],
+        })
+
+    return {
+        "total_receipts": receipt_summary[0] if receipt_summary else 0,
+        "total_spent": round(receipt_summary[1], 2) if receipt_summary else 0.0,
+        "total_saved": round(receipt_summary[2], 2) if receipt_summary else 0.0,
+        "latest_receipt_date": receipt_summary[3] if receipt_summary else "N/A",
+        "items": items,
+    }
+
+
+def extract_keywords(text: str) -> set:
+    tokens = re.findall(r"[A-Z]{3,}", text.upper())
+    return {t for t in tokens if t not in STOPWORDS}
+
+
+def match_habits_to_circular(habits: Dict[str, Any], products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Cross-references household receipt items against the current week's Lowes Foods sale products."""
+    matches = []
+    seen_pairs = set()
+
+    for h in habits.get("items", []):
+        h_name = h["item_name"]
+        h_kw = extract_keywords(h_name)
+        if not h_kw:
+            continue
+
+        for p in products:
+            p_name = (p.get("name") or "").strip()
+            p_desc = (p.get("description") or "").replace("\n", " ").strip()
+            p_kw = extract_keywords(p_name + " " + p_desc)
+            overlap = h_kw.intersection(p_kw)
+
+            # Match if at least one distinctive brand/product keyword overlaps
+            # (or 2 keywords if generic like POTATO / CHIPS / BREAD / BEEF)
+            generic_words = {"POTATO", "CHIPS", "BREAD", "BEEF", "CHICKEN", "MILK", "CHEESE", "SALAD", "CAKE", "BEER"}
+            strong_overlap = overlap - generic_words
+            is_match = len(strong_overlap) >= 1 or len(overlap) >= 2
+
+            if is_match:
+                pair_key = (h_name, p_name)
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+
+                price = (p.get("price_text") or "").strip()
+                unit = (p.get("post_price_text") or "").strip()
+                story = (p.get("sale_story") or "").strip()
+                price_str = f"${price}" if price and not price.startswith("$") else price
+                if unit and price_str:
+                    price_str = f"{price_str} ({unit})"
+
+                matches.append({
+                    "habit_item": h_name,
+                    "last_bought": h["last_bought"],
+                    "usual_price": f"${h['avg_paid_price']:.2f} (reg ${h['avg_unit_price']:.2f})",
+                    "sale_item": p_name,
+                    "sale_price": price_str,
+                    "sale_story": story,
+                    "sale_desc": p_desc,
+                })
+    return matches
+
+
+def fetch_lowes_foods_circular(postal_code: str = "28027", store_code: str = "282") -> Dict[str, Any]:
     """
     Pulls the actual live product items (Meat, Chicken, Seafood, BOGOs, Digital Coupons)
-    directly from the official Lowes Foods Weekly Ad API.
+    directly from the official Lowes Foods Weekly Ad API for Lowes Foods of Concord (#282, 28027).
     """
     pub_url = (
         f"https://dam.flippenterprise.net/flyerkit/publications/fflowesfoods"
@@ -282,49 +587,86 @@ def fetch_lowes_foods_circular(postal_code: str = "27601", store_code: str = "18
         "valid_from": valid_from,
         "valid_to": valid_to,
         "total_items": len(products),
+        "raw_products": products,
         "meat_seafood": meat_seafood_items,
         "heavy_discounts": heavy_discount_items,
     }
 
 
-def synthesize_lowes_foods_briefing(circular_data: Dict[str, Any]) -> str:
-    """Uses Gemma 4 to organize the actual Lowes Foods sale products into clear categories."""
+def synthesize_lowes_foods_briefing(circular_data: Dict[str, Any], habits: Dict[str, Any]) -> str:
+    """Uses Gemma 4 31B to create a personalized weekly shopping list combining receipt habits + weekly ad discounts."""
     valid_range = f"{circular_data['valid_from'][:10]} to {circular_data['valid_to'][:10]}"
-    meat_list = "\n".join(f"- {item}" for item in circular_data["meat_seafood"][:30])
-    discount_list = "\n".join(f"- {item}" for item in circular_data["heavy_discounts"][:22])
+    meat_list = "\n".join(f"- {item}" for item in circular_data["meat_seafood"][:22])
+    discount_list = "\n".join(f"- {item}" for item in circular_data["heavy_discounts"][:18])
 
-    prompt = f"""Here are the exact items on sale right now from the official Lowes Foods Weekly Ad ({valid_range}):
+    # Build receipt habit summary & direct matches
+    matches = match_habits_to_circular(habits, circular_data.get("raw_products", []))
+    match_lines = []
+    for m in matches[:10]:
+        deal_part = " | ".join(x for x in [m["sale_price"], m["sale_story"], m["sale_desc"]] if x)
+        match_lines.append(
+            f"- ON SALE NOW: {m['sale_item']} ({deal_part}) <-- Matches receipt item '{m['habit_item']}' "
+            f"(last bought {m['last_bought']} at {m['usual_price']})"
+        )
+    matches_block = "\n".join(match_lines) if match_lines else "- No exact brand matches this week, check category staples below."
 
-MEAT, CHICKEN & SEAFOOD ITEMS ON SALE:
-{meat_list}
+    habit_lines = []
+    for h in habits.get("items", [])[:18]:
+        habit_lines.append(
+            f"- {h['item_name']} (Bought {h['trip_count']}x, qty {h['total_qty']:g}, "
+            f"paid ${h['avg_paid_price']:.2f}, last {h['last_bought']})"
+        )
+    habits_block = "\n".join(habit_lines) if habit_lines else "- No receipt items recorded yet."
 
-OTHER BOGO & HEAVILY DISCOUNTED ITEMS:
-{discount_list}
-
-Create a clean, casual, easy-to-scan HTML shopping list of these exact products and their prices/deals so Fabricia and I can plan our grocery trip.
-Organize the output into these exact 4 sections using `<h3>` and `<ul><li>`:
-1. **🍗 Chicken & Poultry Deals** (List all chicken/poultry items concisely with exact price/discount)
-2. **🥩 Beef, Pork & Bacon Deals** (List all steak, roast, ground beef, pork, bacon, sausage items concisely with exact price/discount)
-3. **🦐 Seafood Deals** (List all shrimp, salmon, crab, lobster, fish fillet items concisely with exact price or BOGO deal)
-4. **🔥 Top 10 BOGOs & Heavy Discounts** (Pick the top 10 best BOGO / $ Off deals from the list with exact details)
-
-Do NOT wrap in `<html>` or `<body>` tags, and do NOT use ```html code fences. Keep every single price and deal accurate to the list above!
-"""
-    print("🧠 Step 3: Formatting actual Lowes Foods sale products with Gemma 4...")
+    prompt = (
+        f"You are building the personalized Smart Shopping weekly grocery list for Fabricia and Erfontes "
+        f"at Lowes Foods of Concord (Ad cycle: {valid_range}).\n\n"
+        f"1. HOUSEHOLD BUYING HABITS (From their Lowes Foods email receipts — "
+        f"{habits.get('total_receipts', 0)} receipts, ${habits.get('total_saved', 0):.2f} saved):\n"
+        f"{habits_block}\n\n"
+        f"2. RECEIPT ITEMS ON SALE THIS WEEK:\n"
+        f"{matches_block}\n\n"
+        f"3. MEAT, CHICKEN & SEAFOOD ON SALE THIS WEEK:\n"
+        f"{meat_list}\n\n"
+        f"4. TOP BOGO & HEAVY DISCOUNTS THIS WEEK:\n"
+        f"{discount_list}\n\n"
+        f"Create a clean, casual, actionable HTML weekly shopping guide & list using ONLY "
+        f"<h3>, <p>, <ul>, <li>, <strong>:\n"
+        f"1. <h3>🎯 Your Receipt Staples ON SALE This Week</h3>: Highlight items from Section 2 "
+        f"or close substitutes from their habits (steaks, chips, bread, milk, sodas, beer, produce) "
+        f"that are on sale right now, comparing the sale deal vs. what they paid on their receipt.\n"
+        f"2. <h3>📋 Suggested Weekly Restock Checklist (Based on Your Habits)</h3>: Recommend 6-8 staple items "
+        f"from their purchase history to restock soon (noting last bought date and matching sale/BOGO deals).\n"
+        f"3. <h3>🍗🥩🦐 Meat, Chicken & Seafood Deals This Week</h3>: Group Chicken/Poultry, "
+        f"Beef/Pork/Bacon, and Seafood deals with exact prices and BOGOs.\n"
+        f"4. <h3>🔥 Other Can't-Miss BOGOs & Heavy Discounts</h3>: Top 8-10 BOGO / Digital Coupon deals.\n\n"
+        f"Do NOT wrap in <html> or <body> tags, and do NOT use markdown code fences. "
+        f"Keep all prices and receipt details 100% accurate!"
+    )
+    print("🧠 Step 3: Generating personalized Smart Shopping list with Gemma 4 31B (Receipts + Weekly Ad)...")
     raw_html = ask_gemma(
-        [{"role": "user", "content": prompt}], temperature=0.2, max_tokens=950
+        [{"role": "user", "content": prompt}], temperature=0.2, max_tokens=1536
     )
     raw_html = re.sub(r"^```(?:html)?\s*", "", raw_html.strip(), flags=re.IGNORECASE)
     raw_html = re.sub(r"\s*```$", "", raw_html.strip())
+
+    receipt_badge = (
+        f'<div style="background-color:#f0fdf4; border:1px solid #bbf7d0; border-radius:6px; padding:10px 14px; '
+        f'margin-bottom:16px; font-size:13px; color:#166534;">'
+        f'🧾 <strong>Receipt Intelligence Active:</strong> Synced <strong>{habits.get("total_receipts", 0)} Lowes Foods receipts</strong> '
+        f'({len(habits.get("items", []))} unique items tracked • Latest receipt: {habits.get("latest_receipt_date", "N/A")} • '
+        f'Total receipt savings tracked: <strong>${habits.get("total_saved", 0):.2f}</strong>).'
+        f'</div>'
+    )
     links_footer = (
         '<h3>🔗 Quick Links</h3>'
         '<ul>'
-        '<li><a href="https://weeklyad.lowesfoods.com/">Lowes Foods Weekly Ad Circular</a></li>'
-        '<li><a href="https://shop.lowesfoods.com/shop/coupons">Lowes Foods Digital Coupons</a></li>'
+        '<li><a href="https://weeklyad.lowesfoods.com/">Lowes Foods of Concord Weekly Ad Circular</a></li>'
+        '<li><a href="https://shop.lowesfoods.com/shop/coupons">Clip Lowes Foods Digital Coupons</a></li>'
         '<li><a href="https://shop.lowesfoods.com/">Lowes Foods To Go (Online Shop)</a></li>'
         '</ul>'
     )
-    return raw_html + "\n" + links_footer
+    return receipt_badge + "\n" + raw_html + "\n" + links_footer
 
 
 # ==============================================================================
@@ -538,16 +880,24 @@ def main():
     header_title = f"🛒 {args.title}" if args.title else "🏷️ Deal & Price Update"
 
     if "lowesfoods" in args.topic.lower() or "lowes foods" in args.topic.lower():
-        print("🛒 Step 1: Fetching live Weekly Ad products directly from Lowes Foods Circular API...")
+        print("🧾 Step 1: Syncing Lowes Foods email receipts from Gmail IMAP into grocery_habits.db...")
+        habits = sync_receipts_from_gmail()
+        print(
+            f"✅ Synced {habits.get('new_receipts_synced', 0)} new receipts "
+            f"(Total tracked: {habits.get('total_receipts', 0)} receipts, "
+            f"{len(habits.get('items', []))} unique items, ${habits.get('total_saved', 0):.2f} saved)."
+        )
+
+        print("🛒 Step 2: Fetching live Weekly Ad products directly from Lowes Foods of Concord (#282)...")
         circular = fetch_lowes_foods_circular()
         print(
             f"✅ Pulled {circular['total_items']} total ad items "
             f"({len(circular['meat_seafood'])} Meat/Chicken/Seafood, "
             f"{len(circular['heavy_discounts'])} BOGO/Heavy Discounts) "
-            f"valid {circular['valid_from']} to {circular['valid_to']}."
+            f"valid {circular['valid_from'][:10]} to {circular['valid_to'][:10]}."
         )
-        body_html = synthesize_lowes_foods_briefing(circular)
-        topic_label = f"Lowes Foods Weekly Ad ({circular['valid_from']} to {circular['valid_to']}) — Meat, Chicken, Seafood & BOGOs"
+        body_html = synthesize_lowes_foods_briefing(circular, habits)
+        topic_label = f"Lowes Foods of Concord ({circular['valid_from'][:10]} to {circular['valid_to'][:10]}) — Personalized by Your Receipts & Weekly Ad"
         full_html = wrap_in_email_template(
             topic_label, [], body_html, recipient_display, title=header_title
         )

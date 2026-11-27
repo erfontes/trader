@@ -2198,7 +2198,7 @@ def smart_route_and_rewrite(
             f"Today is {today_str}.\n"
             f"You are a fast search router for a personal AI assistant.\n"
             f"Decide if the user's message requires LIVE WEB SEARCH (current sales/deals/coupons, home/property values, prices, products/specs/reviews, stocks, weather, sports scores, news, local stores, recent events, specific real-world facts).\n"
-            f"If it can be answered purely from general knowledge, math, coding, writing, translation, or brainstorming, reply with ONLY:\n"
+            f"If it can be answered purely from general knowledge, math, coding, writing, translation, brainstorming, or organizing/comparing information already discussed in the conversation (e.g. 'create a comparison table', 'summarize that'), reply with ONLY:\n"
             f"NO_SEARCH\n"
             f"If it needs web search, reply with ONLY one line:\n"
             f"SEARCH: <clean concise search query>\n"
@@ -2371,9 +2371,11 @@ def build_augmented_messages(
 
         augmented_user_prompt = (
             f"Current Date: {today_str}\n"
-            f"SYSTEM INSTRUCTION: Our web gateway has ALREADY fetched the live webpage/document text and search results for you below. "
+            f"SYSTEM INSTRUCTION: Our web gateway has ALREADY fetched live web/document results below. "
             f"Do NOT say that you lack internet access or cannot open links/files. "
-            f"Answer the user's request directly using the provided CONTEXT below.\n\n"
+            f"Use the live results below for current/2026 facts, prices, deals, and newly released products — "
+            f"AND seamlessly combine them with your own knowledge and conversation history to give a complete, natural, helpful answer. "
+            f"Ignore irrelevant search hits, and NEVER write robotic disclaimers like 'Based on the provided context' or 'No information provided in context' for well-known companies, places, or topics you already know.\n\n"
             f"=== LIVE CONTEXT ===\n{joined_context}\n====================\n\n"
             f"User Request: {cleaned_user_req}"
         )
@@ -2381,7 +2383,7 @@ def build_augmented_messages(
         reused_ctx = LAST_WEB_CONTEXT["context"][:4500]
         augmented_user_prompt = (
             f"Current Date: {today_str}\n"
-            f"Reference Context from earlier in this conversation (if relevant to the follow-up):\n"
+            f"Optional reference context from earlier in this conversation (use ONLY if relevant; freely use your own knowledge to give a complete answer, and never say 'No information provided in context'):\n"
             f"=== PRIOR CONTEXT ===\n{reused_ctx}\n=====================\n\n"
             f"User Follow-up Request: {last_user_msg}"
         )
