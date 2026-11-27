@@ -37,9 +37,11 @@ if os.path.isdir(_conda_bin):
 import re
 import json
 import time
+import base64
 import socket
 import urllib.parse
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -91,7 +93,7 @@ USER_AGENT = (
 DESKTOP_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/126.0.0.0 Safari/537.36"
+    "Chrome/131.0.0.0 Safari/537.36"
 )
 
 
@@ -358,12 +360,130 @@ def search_ddg_lite(query: str, max_results: int = 4) -> list:
     return results
 
 
+def unwrap_bing_url(href: str) -> str:
+    """Decode Bing click-redirect URLs (bing.com/ck/a?...&u=a1<base64>) into clean target URLs."""
+    if not href:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(href)
+        if "bing.com" in parsed.netloc and parsed.path.startswith("/ck/"):
+            qs = urllib.parse.parse_qs(parsed.query)
+            u_vals = qs.get("u") or []
+            if u_vals and u_vals[0].startswith("a1"):
+                b64 = u_vals[0][2:]
+                b64 += "=" * (-len(b64) % 4)
+                decoded = base64.urlsafe_b64decode(b64.encode("ascii")).decode("utf-8", errors="ignore")
+                if decoded.startswith("http"):
+                    return decoded
+    except Exception:
+        pass
+    return href
+
+
+def unwrap_yahoo_url(href: str) -> str:
+    """Extract clean target URL from Yahoo redirect links (/RU=<encoded_url>/RK=...)."""
+    if not href:
+        return ""
+    m = re.search(r"/RU=([^/]+)/RK=", href)
+    if m:
+        decoded = urllib.parse.unquote(m.group(1))
+        if decoded.startswith("http"):
+            return decoded
+    return href
+
+
+def search_bing_web(query: str, max_results: int = 6) -> list:
+    """Free, zero-account general web search via Bing Web Search."""
+    results = []
+    try:
+        resp = requests.get(
+            "https://www.bing.com/search",
+            params={"q": query},
+            headers={
+                "User-Agent": DESKTOP_UA,
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            seen_urls = set()
+            for block in soup.select("li.b_algo"):
+                a_tag = block.select_one("h2 a")
+                if not a_tag:
+                    continue
+                title = a_tag.get_text(" ", strip=True)
+                url = unwrap_bing_url(a_tag.get("href", ""))
+                if url.rstrip("/") in ("https://www.google.com", "https://search.google", "https://www.bing.com"):
+                    continue
+                snip_tag = (
+                    block.select_one(".b_caption p")
+                    or block.select_one("p.b_lineclamp2")
+                    or block.select_one("p.b_lineclamp3")
+                    or block.select_one("p.b_lineclamp4")
+                    or block.select_one(".b_caption")
+                )
+                snippet = snip_tag.get_text(" ", strip=True) if snip_tag else ""
+                if url and url.startswith("http") and url not in seen_urls:
+                    seen_urls.add(url)
+                    results.append({
+                        "title": title,
+                        "url": url,
+                        "snippet": snippet[:500],
+                        "engine": "bing",
+                    })
+                if len(results) >= max_results:
+                    break
+    except Exception as e:
+        print(f"[Search Warning] Bing search error: {e}")
+    return results
+
+
+def search_yahoo_web(query: str, max_results: int = 6) -> list:
+    """Free, zero-account general web search via Yahoo Web Search."""
+    results = []
+    try:
+        resp = requests.get(
+            "https://search.yahoo.com/search",
+            params={"p": query, "ei": "UTF-8"},
+            headers={
+                "User-Agent": DESKTOP_UA,
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            seen_urls = set()
+            for block in soup.select("div.dd.algo"):
+                a_tag = block.select_one("h3.title a") or block.select_one("a.d-ib")
+                if not a_tag:
+                    continue
+                title = a_tag.get_text(" ", strip=True)
+                url = unwrap_yahoo_url(a_tag.get("href", ""))
+                snip_tag = block.select_one("div.compText") or block.select_one("p")
+                snippet = snip_tag.get_text(" ", strip=True) if snip_tag else ""
+                if url and url.startswith("http") and url not in seen_urls:
+                    seen_urls.add(url)
+                    results.append({
+                        "title": title,
+                        "url": url,
+                        "snippet": snippet[:500],
+                        "engine": "yahoo",
+                    })
+                if len(results) >= max_results:
+                    break
+    except Exception as e:
+        print(f"[Search Warning] Yahoo search error: {e}")
+    return results
+
+
 def search_web(query: str, max_results: int = 6) -> list:
     """
     Smart Multi-Provider Web Search:
       1. Serper.dev (Google Web Search API) if configured
       2. Tavily Search API if configured
-      3. Free Hybrid Fallback: DuckDuckGo (HTML + Lite) + Google News RSS
+      3. Free Zero-Account General Web Search: Bing + Yahoo + Google News RSS + DDG fallback
     """
     cfg = load_search_config()
 
@@ -378,18 +498,29 @@ def search_web(query: str, max_results: int = 6) -> list:
             return hits
 
     is_recent = bool(RECENCY_QUERY_PATTERNS.search(query))
-    google_hits = search_google_live(query, max_results=4 if is_recent else 2, is_recent=is_recent)
-    ddg_hits = search_duckduckgo(query, max_results=4, is_recent=is_recent)
 
-    if is_recent and not ddg_hits:
-        ddg_hits = search_duckduckgo(query, max_results=4, is_recent=False)
-    if not ddg_hits:
-        ddg_hits = search_ddg_lite(query, max_results=4)
+    # Primary free general web search (Bing -> Yahoo -> DuckDuckGo)
+    web_hits = search_bing_web(query, max_results=max_results)
+    if len(web_hits) < 3:
+        yahoo_hits = search_yahoo_web(query, max_results=max_results)
+        seen = {h["url"] for h in web_hits}
+        for yh in yahoo_hits:
+            if yh["url"] not in seen:
+                web_hits.append(yh)
+                seen.add(yh["url"])
 
-    if is_recent:
-        combined = google_hits + ddg_hits
+    if not web_hits:
+        web_hits = search_duckduckgo(query, max_results=4, is_recent=is_recent)
+    if not web_hits:
+        web_hits = search_ddg_lite(query, max_results=4)
+
+    # Blend in Google News RSS for recency/news/deals queries (or if general web hits are sparse)
+    google_hits = search_google_live(query, max_results=2 if web_hits else 4, is_recent=is_recent)
+
+    if is_recent and google_hits:
+        combined = web_hits[:4] + google_hits[:2]
     else:
-        combined = ddg_hits + google_hits
+        combined = web_hits + google_hits
 
     return combined[:max_results]
 
@@ -2053,8 +2184,11 @@ def smart_route_and_rewrite(
     if force_search:
         router_prompt = (
             f"Today is {today_str}.\n"
-            f"Rewrite the user's message into a single clean, typo-corrected web search query (under 14 words). "
-            f"Fix any misspellings (brand names, street names, people). Add '{month_year}' if asking about current deals, prices, news, or live info.\n"
+            f"Rewrite the user's message into a clean web search query (under 12 words).\n"
+            f"Rules:\n"
+            f"- Fix obvious typos in well-known brand names, but NEVER change street addresses or zip codes.\n"
+            f"- ONLY append '{month_year}' if asking about current sales, deals, news, scores, or live events. Do NOT add dates to product specs, reviews, or street addresses.\n"
+            f"- If comparing TWO products/items (X vs Y), output TWO short queries separated by ' | ' (e.g. SEARCH: Whoop 5.0 specs review | Google Fitbit Air specs review).\n"
             f"Reply with ONLY: SEARCH: <query>\n\n"
             + (f"Recent conversation:\n{ctx_block}\n\n" if ctx_block else "")
             + f"User message: {last_user_msg[:300]}"
@@ -2063,11 +2197,15 @@ def smart_route_and_rewrite(
         router_prompt = (
             f"Today is {today_str}.\n"
             f"You are a fast search router for a personal AI assistant.\n"
-            f"Decide if the user's message requires LIVE WEB SEARCH (current sales/deals/coupons, home/property values, prices, stocks, weather, sports scores, news, local stores/hours, recent events, specific real-world facts/people you might not know).\n"
+            f"Decide if the user's message requires LIVE WEB SEARCH (current sales/deals/coupons, home/property values, prices, products/specs/reviews, stocks, weather, sports scores, news, local stores, recent events, specific real-world facts).\n"
             f"If it can be answered purely from general knowledge, math, coding, writing, translation, or brainstorming, reply with ONLY:\n"
             f"NO_SEARCH\n"
-            f"If it needs web search, fix ALL typos/misspellings and reply with ONLY one line:\n"
-            f"SEARCH: <clean concise search query, include '{month_year}' for current/live topics>\n\n"
+            f"If it needs web search, reply with ONLY one line:\n"
+            f"SEARCH: <clean concise search query>\n"
+            f"Rules:\n"
+            f"- Fix obvious typos in well-known brand names, but NEVER alter street addresses or zip codes.\n"
+            f"- ONLY append '{month_year}' for current sales, deals, news, or live events (NOT for product specs, reviews, or street addresses).\n"
+            f"- If comparing TWO products/items (X vs Y), output TWO short queries separated by ' | ' (e.g. SEARCH: Whoop 5.0 specs review | Google Fitbit Air specs review).\n\n"
             + (f"Recent conversation:\n{ctx_block}\n\n" if ctx_block else "")
             + f"User message: {last_user_msg[:300]}"
         )
@@ -2178,7 +2316,24 @@ def build_augmented_messages(
         do_search, query = smart_route_and_rewrite(raw_messages, force_search=False)
 
     if do_search and query:
-        hits = search_web(query, max_results=6)
+        sub_queries = [sq.strip() for sq in query.split("|") if sq.strip()][:2]
+        hits = []
+        if len(sub_queries) > 1:
+            seen_urls = set()
+            for q_idx, sq in enumerate(sub_queries):
+                if q_idx > 0:
+                    time.sleep(0.2)
+                added_for_q = 0
+                for h in search_web(sq, max_results=4):
+                    if h["url"] not in seen_urls:
+                        seen_urls.add(h["url"])
+                        hits.append(h)
+                        added_for_q += 1
+                        if added_for_q >= 3:
+                            break
+        else:
+            hits = search_web(sub_queries[0], max_results=6)
+        hits = hits[:6]
         if hits:
             search_engine_used = hits[0].get("engine", "web")
         scraped_count = 0
